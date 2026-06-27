@@ -22,7 +22,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
-use tower_protocol::msg::{Dropped, Event as EvMsg, Hello, Level, Log, Print, ShellCommand, ShellComplete, ShellCompletions, ShellResponse};
+use tower_protocol::msg::{Dropped, Event as EvMsg, Level, Log, Print, ShellCommand, ShellComplete, ShellCompletions, ShellResponse};
 use tower_protocol::{FrameDecoder, MsgType, decode_frame, encode_frame};
 
 const CAP: usize = 5000; // scrollback per pane
@@ -53,7 +53,6 @@ struct App {
     cmd_id: u16,
     req_id: u16,
     seq: u16,
-    fw: String,
     resp_buf: String, // accumulates a chunked shell response until `last`
     pending_req: Option<u16>,
     hint: String, // transient completion / status hint
@@ -81,7 +80,6 @@ impl App {
             cmd_id: 1,
             req_id: 1,
             seq: 0,
-            fw: "?".into(),
             resp_buf: String::new(),
             pending_req: None,
             hint: String::new(),
@@ -176,11 +174,6 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
         return;
     }
     match mt {
-        MsgType::Hello => {
-            if let Ok(h) = postcard::from_bytes::<Hello>(payload) {
-                app.fw = h.firmware_version.to_string();
-            }
-        }
         MsgType::Log => {
             if let Ok(l) = postcard::from_bytes::<Log>(payload) {
                 let (lbl, color) = level_style(l.level);
@@ -445,7 +438,12 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
 
     // Header.
     let conn = if app.connected() { "●" } else { "○ reconnecting…" };
-    let header = format!(" HARDWARIO TOWER Console — fw {} — {} {}", app.fw, app.port_name, conn);
+    let header = format!(
+        " HARDWARIO TOWER Console v{} — {} {}",
+        env!("CARGO_PKG_VERSION"),
+        app.port_name,
+        conn
+    );
     f.render_widget(Paragraph::new(header).style(bar), rows[0]);
 
     if app.zoom {

@@ -17,6 +17,9 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 postcard = { version = "1", default-features = false }
 serde = "1"
-# The single source of truth for the wire format, shared with the firmware. Path dep
-# during co-development; switch to a pinned git rev for releases.
-tower-protocol = { path = "../../embassy/crates/tower-protocol" }
+# Single source of truth for the wire format, shared with the firmware. postcard isn't
+# self-describing, so both ends MUST be the same version — pinned to a firmware tag so a
+# standalone clone builds reproducibly. Bump this tag in lockstep with any wire change.
+# For side-by-side development against a local checkout, see `.cargo/config.toml`
+# (gitignored `paths` override) — it doesn't touch Cargo.lock or affect other clones.
+tower-protocol = { git = "https://github.com/hardwario/tower-firmware", tag = "tower-protocol-v0.1.0" }

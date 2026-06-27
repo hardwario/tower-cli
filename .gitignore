@@ -1,2 +1,4 @@
 /target
 .DS_Store
+# Local dev override (side-by-side tower-protocol checkout); not for clones/CI.
+/.cargo/config.toml

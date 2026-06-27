@@ -63,6 +63,11 @@ enum Cmd {
     },
     /// Open an interactive shell (commands start with `/`).
     Shell,
+    /// Run one shell command and print its response, then exit (for scripts / CI).
+    Exec {
+        /// The command line, e.g. "/system/resource print".
+        line: String,
+    },
     /// Open the full-screen TUI console (logs + events + shell).
     Console,
     /// Ask the target to complete a partial command line (target-authoritative).
@@ -85,6 +90,7 @@ fn main() -> Result<()> {
         Cmd::Logs { no_colors, send } => stream(cli.port, !no_colors, View::Logs, send),
         Cmd::Events { no_colors } => stream(cli.port, !no_colors, View::Events, None),
         Cmd::Shell => shell(cli.port),
+        Cmd::Exec { line } => exec_cmd(cli.port, line),
         Cmd::Console => tui::run(pick_port(cli.port)?),
         Cmd::Complete { line } => complete_cmd(cli.port, line),
         Cmd::Monitor { hex } => monitor(cli.port, hex),
@@ -381,6 +387,33 @@ fn shell(port: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run a single shell command non-interactively: send it, print the (reassembled)
+/// response, and exit non-zero if the device reports a non-zero result or times out.
+fn exec_cmd(port: Option<String>, line: String) -> Result<()> {
+    let port = pick_port(port)?;
+    let mut sp = open(&port)?;
+    let mut dec = FrameDecoder::new();
+    let mut buf = [0u8; tower_protocol::MAX_WIRE];
+    let n = encode_frame(MsgType::ShellCommand, 0, &ShellCommand { cmd_id: 1, line: &line }, &mut buf)
+        .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
+    sp.write_all(&buf[..n])?;
+    sp.flush()?;
+    match read_response(&mut *sp, &mut dec, 1, Duration::from_millis(1500)) {
+        Some((result, text)) => {
+            print!("{text}");
+            if !text.is_empty() && !text.ends_with('\n') {
+                println!();
+            }
+            if result != 0 {
+                eprintln!("[result {result}]");
+                std::process::exit(i32::from(result));
+            }
+            Ok(())
+        }
+        None => bail!("no response (timeout)"),
+    }
 }
 
 /// Read frames until the `ShellResponse` for `cmd_id` completes (`last`), or timeout.

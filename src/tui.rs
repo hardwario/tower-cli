@@ -54,6 +54,7 @@ struct App {
     req_id: u16,
     seq: u16,
     fw: String,
+    resp_buf: String, // accumulates a chunked shell response until `last`
     pending_req: Option<u16>,
     hint: String, // transient completion / status hint
     last_open_attempt: Instant,
@@ -81,6 +82,7 @@ impl App {
             req_id: 1,
             seq: 0,
             fw: "?".into(),
+            resp_buf: String::new(),
             pending_req: None,
             hint: String::new(),
             last_open_attempt: Instant::now() - Duration::from_secs(10),
@@ -166,6 +168,13 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
     let Ok((mt, _seq, payload)) = decode_frame(inner) else {
         return;
     };
+    // While paused (F5), freeze the streaming panes — keep draining the port (so its
+    // buffer can't overflow) but don't append. Interactive traffic (Hello, shell
+    // responses/completions) still flows so the shell stays usable.
+    let streaming = matches!(mt, MsgType::Log | MsgType::Print | MsgType::Event | MsgType::Dropped);
+    if app.paused && streaming {
+        return;
+    }
     match mt {
         MsgType::Hello => {
             if let Ok(h) = postcard::from_bytes::<Hello>(payload) {
@@ -198,12 +207,18 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
             }
         }
         MsgType::ShellResponse => {
+            // Reassemble chunks (`chunk`/`last`) into one response before splitting it
+            // into lines, so a chunk boundary mid-line doesn't fragment the display.
             if let Ok(r) = postcard::from_bytes::<ShellResponse>(payload) {
-                for line in r.text.lines() {
-                    push_cap(&mut app.responses, line.to_string());
-                }
-                if r.result != 0 {
-                    push_cap(&mut app.responses, format!("[result {}]", r.result));
+                app.resp_buf.push_str(r.text);
+                if r.last {
+                    for line in app.resp_buf.lines() {
+                        push_cap(&mut app.responses, line.to_string());
+                    }
+                    if r.result != 0 {
+                        push_cap(&mut app.responses, format!("[result {}]", r.result));
+                    }
+                    app.resp_buf.clear();
                 }
             }
         }
@@ -392,6 +407,7 @@ fn send_command(app: &mut App) {
     let cmd_id = app.cmd_id;
     app.cmd_id = app.cmd_id.wrapping_add(1);
     push_cap(&mut app.responses, format!("> {line}"));
+    app.resp_buf.clear(); // discard any incomplete prior response
     let _ = send_frame(app, MsgType::ShellCommand, &ShellCommand { cmd_id, line: &line });
     if app.history.last().map(|h| h.as_str()) != Some(line.as_str()) {
         app.history.push(line);
@@ -468,42 +484,36 @@ fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
     ])
     .split(cols[0]);
 
-    render_text_pane(f, left[0], "Device Events", app.focus == Pane::Events, &events_lines(app), app.scroll[1], false);
+    let plain = |s: &String| Line::raw(s.clone());
+    let colored = |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
+    render_text_pane(f, left[0], "Device Events", app.focus == Pane::Events, &app.events, app.scroll[1], plain);
     render_command(f, left[1], app);
-    render_text_pane(f, left[2], "Shell Responses", app.focus == Pane::Responses, &resp_lines(app), app.scroll[2], true);
-    render_text_pane(f, cols[1], "Device Logs", app.focus == Pane::Logs, &log_lines(app), app.scroll[0], false);
+    render_text_pane(f, left[2], "Shell Responses", app.focus == Pane::Responses, &app.responses, app.scroll[2], plain);
+    render_text_pane(f, cols[1], "Device Logs", app.focus == Pane::Logs, &app.logs, app.scroll[0], colored);
 }
 
 fn render_zoom(f: &mut ratatui::Frame, app: &App, body: Rect) {
+    let plain = |s: &String| Line::raw(s.clone());
+    let colored = |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
     match app.focus {
-        Pane::Logs => render_text_pane(f, body, "", false, &log_lines(app), app.scroll[0], false),
-        Pane::Events => render_text_pane(f, body, "", false, &events_lines(app), app.scroll[1], false),
-        Pane::Responses => render_text_pane(f, body, "", false, &resp_lines(app), app.scroll[2], true),
+        Pane::Logs => render_text_pane(f, body, "", false, &app.logs, app.scroll[0], colored),
+        Pane::Events => render_text_pane(f, body, "", false, &app.events, app.scroll[1], plain),
+        Pane::Responses => render_text_pane(f, body, "", false, &app.responses, app.scroll[2], plain),
         Pane::Command => render_command(f, body, app),
     }
 }
 
-fn log_lines(app: &App) -> Vec<Line<'static>> {
-    app.logs
-        .iter()
-        .map(|(s, c)| Line::from(Span::styled(s.clone(), Style::new().fg(*c))))
-        .collect()
-}
-fn events_lines(app: &App) -> Vec<Line<'static>> {
-    app.events.iter().map(|s| Line::raw(s.clone())).collect()
-}
-fn resp_lines(app: &App) -> Vec<Line<'static>> {
-    app.responses.iter().map(|s| Line::raw(s.clone())).collect()
-}
-
-fn render_text_pane(
+/// Render a bottom-anchored scrollback pane, materializing **only the visible window**
+/// (not the whole `CAP`-deep deque every frame). `off` is the first visible line:
+/// bottom-anchored, minus the user's scroll-up offset; `to_line` styles each item.
+fn render_text_pane<T>(
     f: &mut ratatui::Frame,
     area: Rect,
     title: &str,
     focused: bool,
-    lines: &[Line<'static>],
+    items: &VecDeque<T>,
     scrollback: usize,
-    _bottom: bool,
+    to_line: impl Fn(&T) -> Line<'static>,
 ) {
     let block = if title.is_empty() {
         Block::default()
@@ -516,11 +526,13 @@ fn render_text_pane(
         Block::bordered().title(title).border_style(style)
     };
     let inner_h = area.height.saturating_sub(if title.is_empty() { 0 } else { 2 }) as usize;
-    let total = lines.len();
+    let total = items.len();
     let max_off = total.saturating_sub(inner_h);
     let off = max_off.saturating_sub(scrollback); // bottom-anchored minus user scrollback
-    let text: Vec<Line> = lines.to_vec();
-    let p = Paragraph::new(text).block(block).scroll((off as u16, 0)).wrap(Wrap { trim: false });
+    // Build from `off` onward only; Paragraph clips the pane bottom, so this shows
+    // items[off .. off + visible_rows] without cloning the lines above the window.
+    let visible: Vec<Line> = items.iter().skip(off).map(to_line).collect();
+    let p = Paragraph::new(visible).block(block).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 

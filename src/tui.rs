@@ -1,10 +1,10 @@
-//! `tower console` — the ratatui TUI (Phase 5).
+//! `tower console` — the ratatui TUI.
 //!
 //! One synchronous loop owns the serial port: it polls the keyboard (short timeout),
 //! drains all incoming frames through one `FrameDecoder`, and redraws. Everything is
 //! async-via-drain — TAB sends a `ShellComplete` and Enter sends a `ShellCommand`; the
 //! responses (`ShellCompletions` / `ShellResponse`) are handled when they arrive in the
-//! drain, so nothing blocks. Layout/keys follow `CONSOLE.md`.
+//! drain, so nothing blocks. Layout/keys follow `docs/console.md` (in the firmware repo).
 //!
 //! Caveat: a TUI needs a real terminal — this is build- + clippy-verified, but NOT
 //! interactively driven here (no TTY available). The completion/command round-trips

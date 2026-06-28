@@ -2,3 +2,5 @@
 .DS_Store
 # Local dev override (side-by-side tower-protocol checkout); not for clones/CI.
 /.cargo/config.toml
+# Release archives / staged binaries (e.g. `tower-v0.1.0-aarch64-apple-darwin{,.tar.gz}`).
+/tower-v*

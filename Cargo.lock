@@ -1078,8 +1078,8 @@ dependencies = [
 
 [[package]]
 name = "tower-protocol"
-version = "0.1.0"
-source = "git+https://github.com/hardwario/tower-firmware?tag=tower-protocol-v0.1.0#ca1740c35ec091cd8bcf4791a3bf41ed2e07e7ce"
+version = "0.2.0"
+source = "git+https://github.com/hardwario/tower-firmware?tag=tower-protocol-v0.2.0#67cb2fac53ff1588cb1a1fd88e3ab8f41de31c6f"
 dependencies = [
  "cobs",
  "heapless",

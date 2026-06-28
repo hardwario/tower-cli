@@ -1,4 +1,5 @@
-//! `tower` — HARDWARIO TOWER console host CLI (Phase 1: devices / logs / monitor).
+//! `tower` — HARDWARIO TOWER host CLI: devices, logs/events, shell/exec, the console TUI,
+//! flash/erase/reset (via the jolt engine), and `fota serve`.
 //!
 //! The firmware's UART is always framed (`tower-protocol`: COBS + CRC + postcard),
 //! so a plain terminal shows binary — this tool decodes it. The same `FrameDecoder`
@@ -22,7 +23,8 @@ use tower_protocol::msg::{
     CandidateKind, Dropped, Event, Hello, Level, Log, Print, ShellCommand, ShellComplete,
     ShellCompletions, ShellResponse,
 };
-use tower_protocol::{FrameDecoder, MsgType, decode_frame, encode_frame};
+use tower_protocol::fota::{FOTA_MANIFEST_OFFSET, SIGNED_LEN};
+use tower_protocol::{FrameDecoder, MAX_WIRE, MsgType, decode_frame, encode_frame, encode_frame_raw};
 
 mod tui;
 
@@ -114,6 +116,29 @@ enum Cmd {
         #[arg(long)]
         bootloader: bool,
     },
+    /// Firmware-over-the-air (FOTA) host-side helpers.
+    Fota {
+        #[command(subcommand)]
+        cmd: FotaCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum FotaCmd {
+    /// Host-proxy image source: serve a signed firmware image to a FOTA gateway on demand.
+    ///
+    /// The gateway (which holds no image of its own) sends `FotaReq{offset,len}` frames over
+    /// the console link; this answers each with the requested image bytes (or the signed
+    /// manifest for the sentinel offset). The node pulls it over the radio, and the
+    /// bootloader verifies the Ed25519 signature + SHA-256 before swapping. See docs/fota.md.
+    Serve {
+        /// The raw firmware image (e.g. `target/fota-ota-v2.bin`).
+        #[arg(long)]
+        image: PathBuf,
+        /// The signed manifest for that image (`fota-sign sign ...`, 116 bytes).
+        #[arg(long)]
+        manifest: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -137,6 +162,9 @@ fn main() -> Result<()> {
         } => flash_cmd(cli.port, file, !no_erase, !no_verify, !no_run, go, verbose),
         Cmd::Erase { verbose } => erase_cmd(cli.port, verbose),
         Cmd::Reset { bootloader } => reset_cmd(cli.port, bootloader),
+        Cmd::Fota { cmd } => match cmd {
+            FotaCmd::Serve { image, manifest } => fota_serve(cli.port, image, manifest),
+        },
     }
 }
 
@@ -188,6 +216,98 @@ fn open(port: &str) -> Result<Box<dyn serialport::SerialPort>> {
         .timeout(Duration::from_millis(200))
         .open()
         .with_context(|| format!("opening {port}"))
+}
+
+// ---- FOTA host-proxy serve ------------------------------------------------
+
+/// Serve a signed firmware image to a FOTA gateway over the framed console link: read the
+/// image + manifest once, then answer each `FotaReq{offset,len}` frame with a `FotaData`
+/// frame (the manifest for the sentinel offset, image bytes otherwise). The gateway relays
+/// the bytes to the node over the radio; the node's bootloader verifies signature + hash
+/// before swapping. Reconnects if the gateway resets. Runs until interrupted.
+fn fota_serve(port: Option<String>, image_path: PathBuf, manifest_path: PathBuf) -> Result<()> {
+    let image = std::fs::read(&image_path)
+        .with_context(|| format!("reading image {}", image_path.display()))?;
+    let manifest = std::fs::read(&manifest_path)
+        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+    if manifest.len() != SIGNED_LEN {
+        bail!(
+            "manifest must be {SIGNED_LEN} bytes (a `fota-sign` .fmanifest), got {}",
+            manifest.len()
+        );
+    }
+    let port = pick_port(port)?;
+    eprintln!(
+        "[tower] fota serve: image {} B + manifest {} B; answering FotaReq on {port}",
+        image.len(),
+        manifest.len()
+    );
+    loop {
+        match open(&port) {
+            Ok(mut sp) => {
+                eprintln!("[tower] connected {port}");
+                if let Err(e) = fota_serve_loop(&mut *sp, &image, &manifest) {
+                    eprintln!("[tower] {port} lost: {e}");
+                }
+            }
+            Err(e) => eprintln!("[tower] {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        eprintln!("[tower] reconnecting…");
+    }
+}
+
+fn fota_serve_loop(
+    sp: &mut dyn serialport::SerialPort,
+    image: &[u8],
+    manifest: &[u8],
+) -> Result<()> {
+    let mut dec = FrameDecoder::new();
+    let mut rbuf = [0u8; 512];
+    let mut seq: u16 = 0;
+    let mut served_to = 0usize; // high-water of image bytes served, for the progress line
+    loop {
+        let n = match sp.read(&mut rbuf) {
+            Ok(0) => continue,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for &b in &rbuf[..n] {
+            let Some(inner) = dec.push(b) else { continue };
+            let Ok((MsgType::FotaReq, _seq, p)) = decode_frame(inner) else { continue };
+            if p.len() < 6 {
+                continue;
+            }
+            let offset = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+            let len = u16::from_le_bytes([p[4], p[5]]) as usize;
+
+            // FotaData payload: offset (echoed) ‖ bytes.
+            let mut payload = Vec::with_capacity(4 + len);
+            payload.extend_from_slice(&offset.to_le_bytes());
+            if offset == FOTA_MANIFEST_OFFSET {
+                payload.extend_from_slice(manifest);
+                eprintln!("[tower] -> manifest ({} B)", manifest.len());
+            } else {
+                let start = (offset as usize).min(image.len());
+                let end = (start + len).min(image.len());
+                payload.extend_from_slice(&image[start..end]);
+                served_to = served_to.max(end);
+                eprint!("\r[tower] serving {served_to}/{} B", image.len());
+                let _ = std::io::stderr().flush();
+            }
+
+            let mut frame = [0u8; MAX_WIRE];
+            match encode_frame_raw(MsgType::FotaData, seq, &payload, &mut frame) {
+                Ok(fn_len) => {
+                    sp.write_all(&frame[..fn_len])?;
+                    sp.flush()?;
+                    seq = seq.wrapping_add(1);
+                }
+                Err(e) => eprintln!("\n[tower] encode FotaData failed: {e:?}"),
+            }
+        }
+    }
 }
 
 fn stream(port: Option<String>, colors: bool, view: View, send: Option<String>) -> Result<()> {

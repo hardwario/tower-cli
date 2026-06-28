@@ -121,7 +121,10 @@ fn pick_port(explicit: Option<String>) -> Result<String> {
     match ports.len() {
         1 => Ok(ports.into_iter().next().unwrap()),
         0 => bail!("no USB serial port found; pass --port"),
-        _ => bail!("multiple USB serial ports; pass --port (one of: {})", ports.join(", ")),
+        _ => bail!(
+            "multiple USB serial ports; pass --port (one of: {})",
+            ports.join(", ")
+        ),
     }
 }
 
@@ -232,7 +235,11 @@ fn render(inner: &[u8], colors: bool, view: View, last_seq: &mut Option<u16>) {
         }
         MsgType::Dropped if view == View::Logs => {
             if let Ok(d) = postcard::from_bytes::<Dropped>(payload) {
-                eprintln!("{} {} log frame(s) dropped (device queue full)", paint("⚠", 33, colors), d.count);
+                eprintln!(
+                    "{} {} log frame(s) dropped (device queue full)",
+                    paint("⚠", 33, colors),
+                    d.count
+                );
             }
         }
         MsgType::Event if view == View::Events => {
@@ -266,7 +273,12 @@ fn print_log(l: &Log, colors: bool) {
 fn print_event(e: &Event, colors: bool) {
     let now = chrono::Local::now().format("%H:%M:%S%.3f");
     let fields: Vec<String> = e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    println!("{now} {} {}  {}", paint("EVENT", 35, colors), e.name, fields.join(" "));
+    println!(
+        "{now} {} {}  {}",
+        paint("EVENT", 35, colors),
+        e.name,
+        fields.join(" ")
+    );
 }
 
 fn paint(s: &str, code: u8, colors: bool) -> String {
@@ -303,8 +315,14 @@ impl Completer for ShellHelper {
         conn.req_id = conn.req_id.wrapping_add(1);
         let req_id = conn.req_id;
         let Conn { sp, dec, .. } = &mut *conn;
-        match request_completions(&mut **sp, dec, line, pos as u16, req_id, Duration::from_millis(800))
-        {
+        match request_completions(
+            &mut **sp,
+            dec,
+            line,
+            pos as u16,
+            req_id,
+            Duration::from_millis(800),
+        ) {
             Some(r) => {
                 let pairs = r
                     .candidates
@@ -316,7 +334,10 @@ impl Completer for ShellHelper {
                             CandidateKind::Arg => "=",
                             CandidateKind::Value => "",
                         };
-                        Pair { display: text.clone(), replacement: format!("{text}{sep}") }
+                        Pair {
+                            display: text.clone(),
+                            replacement: format!("{text}{sep}"),
+                        }
                     })
                     .collect();
                 Ok((r.token_start as usize, pairs))
@@ -338,7 +359,11 @@ fn shell(port: Option<String>) -> Result<()> {
     let sp = open(&port)?;
     eprintln!("[tower] shell on {port} — TAB completes; commands start with '/'; 'exit' to quit");
 
-    let conn = Rc::new(RefCell::new(Conn { sp, dec: FrameDecoder::new(), req_id: 0 }));
+    let conn = Rc::new(RefCell::new(Conn {
+        sp,
+        dec: FrameDecoder::new(),
+        req_id: 0,
+    }));
     let mut rl: Editor<ShellHelper, rustyline::history::DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(ShellHelper { conn: conn.clone() }));
 
@@ -359,9 +384,13 @@ fn shell(port: Option<String>) -> Result<()> {
                 let mut c = conn.borrow_mut();
                 let Conn { sp, dec, .. } = &mut *c;
                 let mut buf = [0u8; tower_protocol::MAX_WIRE];
-                let n =
-                    encode_frame(MsgType::ShellCommand, seq, &ShellCommand { cmd_id, line }, &mut buf)
-                        .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
+                let n = encode_frame(
+                    MsgType::ShellCommand,
+                    seq,
+                    &ShellCommand { cmd_id, line },
+                    &mut buf,
+                )
+                .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
                 seq = seq.wrapping_add(1);
                 sp.write_all(&buf[..n])?;
                 sp.flush()?;
@@ -396,8 +425,16 @@ fn exec_cmd(port: Option<String>, line: String) -> Result<()> {
     let mut sp = open(&port)?;
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; tower_protocol::MAX_WIRE];
-    let n = encode_frame(MsgType::ShellCommand, 0, &ShellCommand { cmd_id: 1, line: &line }, &mut buf)
-        .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
+    let n = encode_frame(
+        MsgType::ShellCommand,
+        0,
+        &ShellCommand {
+            cmd_id: 1,
+            line: &line,
+        },
+        &mut buf,
+    )
+    .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
     sp.write_all(&buf[..n])?;
     sp.flush()?;
     match read_response(&mut *sp, &mut dec, 1, Duration::from_millis(1500)) {
@@ -436,13 +473,14 @@ fn read_response(
         for &b in &buf[..nread] {
             if let Some(inner) = dec.push(b)
                 && let Ok((MsgType::ShellResponse, _, payload)) = decode_frame(inner)
-                    && let Ok(r) = postcard::from_bytes::<ShellResponse>(payload)
-                        && r.cmd_id == cmd_id {
-                            text.push_str(r.text);
-                            if r.last {
-                                return Some((r.result, text));
-                            }
-                        }
+                && let Ok(r) = postcard::from_bytes::<ShellResponse>(payload)
+                && r.cmd_id == cmd_id
+            {
+                text.push_str(r.text);
+                if r.last {
+                    return Some((r.result, text));
+                }
+            }
         }
     }
     None
@@ -469,8 +507,17 @@ fn request_completions(
     timeout: Duration,
 ) -> Option<CompletionResult> {
     let mut buf = [0u8; tower_protocol::MAX_WIRE];
-    let n = encode_frame(MsgType::ShellComplete, 0, &ShellComplete { req_id, line, cursor }, &mut buf)
-        .ok()?;
+    let n = encode_frame(
+        MsgType::ShellComplete,
+        0,
+        &ShellComplete {
+            req_id,
+            line,
+            cursor,
+        },
+        &mut buf,
+    )
+    .ok()?;
     sp.write_all(&buf[..n]).ok()?;
     sp.flush().ok()?;
 
@@ -485,19 +532,20 @@ fn request_completions(
         for &b in &rbuf[..nread] {
             if let Some(inner) = dec.push(b)
                 && let Ok((MsgType::ShellCompletions, _, payload)) = decode_frame(inner)
-                    && let Ok(c) = postcard::from_bytes::<ShellCompletions>(payload)
-                        && c.req_id == req_id {
-                            return Some(CompletionResult {
-                                token_start: c.token_start,
-                                common_prefix: c.common_prefix.to_string(),
-                                candidates: c
-                                    .candidates
-                                    .iter()
-                                    .map(|cd| (cd.text.to_string(), cd.kind))
-                                    .collect(),
-                                more: c.more,
-                            });
-                        }
+                && let Ok(c) = postcard::from_bytes::<ShellCompletions>(payload)
+                && c.req_id == req_id
+            {
+                return Some(CompletionResult {
+                    token_start: c.token_start,
+                    common_prefix: c.common_prefix.to_string(),
+                    candidates: c
+                        .candidates
+                        .iter()
+                        .map(|cd| (cd.text.to_string(), cd.kind))
+                        .collect(),
+                    more: c.more,
+                });
+            }
         }
     }
     None
@@ -508,7 +556,14 @@ fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
     let mut sp = open(&port)?;
     let mut dec = FrameDecoder::new();
     let cursor = line.len() as u16;
-    match request_completions(&mut *sp, &mut dec, &line, cursor, 1, Duration::from_millis(1500)) {
+    match request_completions(
+        &mut *sp,
+        &mut dec,
+        &line,
+        cursor,
+        1,
+        Duration::from_millis(1500),
+    ) {
         Some(r) => {
             println!(
                 "token_start={} common_prefix={:?}{}",
@@ -530,7 +585,10 @@ fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
 fn monitor(port: Option<String>, hex: bool) -> Result<()> {
     let port = pick_port(port)?;
     let mut sp = open(&port)?;
-    eprintln!("[tower] monitoring {port} ({})", if hex { "raw hex" } else { "frames" });
+    eprintln!(
+        "[tower] monitoring {port} ({})",
+        if hex { "raw hex" } else { "frames" }
+    );
     let mut dec = FrameDecoder::new();
     let mut buf = [0u8; 512];
     loop {
@@ -563,5 +621,9 @@ fn monitor(port: Option<String>, hex: bool) -> Result<()> {
 }
 
 fn hexline(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }

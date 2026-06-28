@@ -22,7 +22,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
-use tower_protocol::msg::{Dropped, Event as EvMsg, Level, Log, Print, ShellCommand, ShellComplete, ShellCompletions, ShellResponse};
+use tower_protocol::msg::{
+    Dropped, Event as EvMsg, Level, Log, Print, ShellCommand, ShellComplete, ShellCompletions,
+    ShellResponse,
+};
 use tower_protocol::{FrameDecoder, MsgType, decode_frame, encode_frame};
 
 const CAP: usize = 5000; // scrollback per pane
@@ -115,9 +118,10 @@ fn run_loop(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
 
         if event::poll(Duration::from_millis(33))?
             && let Event::Key(key) = event::read()?
-                && key.kind != KeyEventKind::Release {
-                    handle_key(&mut app, key.code, key.modifiers);
-                }
+            && key.kind != KeyEventKind::Release
+        {
+            handle_key(&mut app, key.code, key.modifiers);
+        }
         drain_serial(&mut app);
     }
     Ok(())
@@ -169,7 +173,10 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
     // While paused (F5), freeze the streaming panes — keep draining the port (so its
     // buffer can't overflow) but don't append. Interactive traffic (Hello, shell
     // responses/completions) still flows so the shell stays usable.
-    let streaming = matches!(mt, MsgType::Log | MsgType::Print | MsgType::Event | MsgType::Dropped);
+    let streaming = matches!(
+        mt,
+        MsgType::Log | MsgType::Print | MsgType::Event | MsgType::Dropped
+    );
     if app.paused && streaming {
         return;
     }
@@ -179,7 +186,12 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
                 let (lbl, color) = level_style(l.level);
                 let secs = l.uptime_us / 1_000_000;
                 let ms = (l.uptime_us % 1_000_000) / 1_000;
-                let line = format!("{} [{secs:>5}.{ms:03}] {lbl} {}: {}", now(), l.module, l.message);
+                let line = format!(
+                    "{} [{secs:>5}.{ms:03}] {lbl} {}: {}",
+                    now(),
+                    l.module,
+                    l.message
+                );
                 push_cap(&mut app.logs, (line, color));
             }
         }
@@ -190,13 +202,20 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
         }
         MsgType::Event => {
             if let Ok(e) = postcard::from_bytes::<EvMsg>(payload) {
-                let fields: Vec<String> = e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                push_cap(&mut app.events, format!("{} {}  {}", now(), e.name, fields.join(" ")));
+                let fields: Vec<String> =
+                    e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                push_cap(
+                    &mut app.events,
+                    format!("{} {}  {}", now(), e.name, fields.join(" ")),
+                );
             }
         }
         MsgType::Dropped => {
             if let Ok(d) = postcard::from_bytes::<Dropped>(payload) {
-                push_cap(&mut app.logs, (format!("⚠ {} log frame(s) dropped", d.count), Color::Yellow));
+                push_cap(
+                    &mut app.logs,
+                    (format!("⚠ {} log frame(s) dropped", d.count), Color::Yellow),
+                );
             }
         }
         MsgType::ShellResponse => {
@@ -217,10 +236,11 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
         }
         MsgType::ShellCompletions => {
             if let Ok(c) = postcard::from_bytes::<ShellCompletions>(payload)
-                && Some(c.req_id) == app.pending_req {
-                    apply_completion(app, &c);
-                    app.pending_req = None;
-                }
+                && Some(c.req_id) == app.pending_req
+            {
+                apply_completion(app, &c);
+                app.pending_req = None;
+            }
         }
         _ => {}
     }
@@ -325,7 +345,11 @@ fn handle_command_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         }
         KeyCode::Backspace => {
             if app.cursor > 0 {
-                let prev = app.input[..app.cursor].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
+                let prev = app.input[..app.cursor]
+                    .chars()
+                    .next_back()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
                 app.cursor -= prev;
                 app.input.remove(app.cursor);
             }
@@ -347,7 +371,11 @@ fn handle_command_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
 }
 
 fn prev_char(s: &str, cur: usize) -> usize {
-    s[..cur].chars().next_back().map(|c| c.len_utf8()).unwrap_or(0)
+    s[..cur]
+        .chars()
+        .next_back()
+        .map(|c| c.len_utf8())
+        .unwrap_or(0)
 }
 fn next_char(s: &str, cur: usize) -> usize {
     s[cur..].chars().next().map(|c| c.len_utf8()).unwrap_or(0)
@@ -387,7 +415,15 @@ fn send_complete(app: &mut App) {
     app.req_id = app.req_id.wrapping_add(1);
     let line = app.input.clone();
     let cursor = app.cursor as u16;
-    if send_frame(app, MsgType::ShellComplete, &ShellComplete { req_id, line: &line, cursor }) {
+    if send_frame(
+        app,
+        MsgType::ShellComplete,
+        &ShellComplete {
+            req_id,
+            line: &line,
+            cursor,
+        },
+    ) {
         app.pending_req = Some(req_id);
     }
 }
@@ -401,7 +437,14 @@ fn send_command(app: &mut App) {
     app.cmd_id = app.cmd_id.wrapping_add(1);
     push_cap(&mut app.responses, format!("> {line}"));
     app.resp_buf.clear(); // discard any incomplete prior response
-    let _ = send_frame(app, MsgType::ShellCommand, &ShellCommand { cmd_id, line: &line });
+    let _ = send_frame(
+        app,
+        MsgType::ShellCommand,
+        &ShellCommand {
+            cmd_id,
+            line: &line,
+        },
+    );
     if app.history.last().map(|h| h.as_str()) != Some(line.as_str()) {
         app.history.push(line);
     }
@@ -433,11 +476,19 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     let area = f.area();
     let bar = Style::new().bg(Color::Gray).fg(Color::Black);
 
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-        .split(area);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
 
     // Header.
-    let conn = if app.connected() { "●" } else { "○ reconnecting…" };
+    let conn = if app.connected() {
+        "●"
+    } else {
+        "○ reconnecting…"
+    };
     let header = format!(
         " HARDWARIO TOWER Console v{} — {} {}",
         env!("CARGO_PKG_VERSION"),
@@ -460,7 +511,11 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         Span::raw("  "),
         Span::styled("F5 Pause", Style::new().fg(y(app.paused)).bg(Color::Gray)),
         Span::raw("  F8 Clear  F10 Quit   "),
-        Span::raw(if app.hint.is_empty() { String::new() } else { format!("[{}] ", app.hint) }),
+        Span::raw(if app.hint.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", app.hint)
+        }),
     ]);
     let footer_area = rows[2];
     f.render_widget(Paragraph::new(footer).style(bar), footer_area);
@@ -468,13 +523,19 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     let clock = now_date();
     let cw = clock.len() as u16;
     if footer_area.width > cw + 1 {
-        let clock_rect = Rect::new(footer_area.x + footer_area.width - cw - 1, footer_area.y, cw, 1);
+        let clock_rect = Rect::new(
+            footer_area.x + footer_area.width - cw - 1,
+            footer_area.y,
+            cw,
+            1,
+        );
         f.render_widget(Paragraph::new(clock).style(bar), clock_rect);
     }
 }
 
 fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body);
     let left = Layout::vertical([
         Constraint::Percentage(25),
         Constraint::Length(3),
@@ -483,20 +544,48 @@ fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
     .split(cols[0]);
 
     let plain = |s: &String| Line::raw(s.clone());
-    let colored = |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
-    render_text_pane(f, left[0], "Device Events", app.focus == Pane::Events, &app.events, app.scroll[1], plain);
+    let colored =
+        |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
+    render_text_pane(
+        f,
+        left[0],
+        "Device Events",
+        app.focus == Pane::Events,
+        &app.events,
+        app.scroll[1],
+        plain,
+    );
     render_command(f, left[1], app);
-    render_text_pane(f, left[2], "Shell Responses", app.focus == Pane::Responses, &app.responses, app.scroll[2], plain);
-    render_text_pane(f, cols[1], "Device Logs", app.focus == Pane::Logs, &app.logs, app.scroll[0], colored);
+    render_text_pane(
+        f,
+        left[2],
+        "Shell Responses",
+        app.focus == Pane::Responses,
+        &app.responses,
+        app.scroll[2],
+        plain,
+    );
+    render_text_pane(
+        f,
+        cols[1],
+        "Device Logs",
+        app.focus == Pane::Logs,
+        &app.logs,
+        app.scroll[0],
+        colored,
+    );
 }
 
 fn render_zoom(f: &mut ratatui::Frame, app: &App, body: Rect) {
     let plain = |s: &String| Line::raw(s.clone());
-    let colored = |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
+    let colored =
+        |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
     match app.focus {
         Pane::Logs => render_text_pane(f, body, "", false, &app.logs, app.scroll[0], colored),
         Pane::Events => render_text_pane(f, body, "", false, &app.events, app.scroll[1], plain),
-        Pane::Responses => render_text_pane(f, body, "", false, &app.responses, app.scroll[2], plain),
+        Pane::Responses => {
+            render_text_pane(f, body, "", false, &app.responses, app.scroll[2], plain)
+        }
         Pane::Command => render_command(f, body, app),
     }
 }
@@ -523,14 +612,18 @@ fn render_text_pane<T>(
         };
         Block::bordered().title(title).border_style(style)
     };
-    let inner_h = area.height.saturating_sub(if title.is_empty() { 0 } else { 2 }) as usize;
+    let inner_h = area
+        .height
+        .saturating_sub(if title.is_empty() { 0 } else { 2 }) as usize;
     let total = items.len();
     let max_off = total.saturating_sub(inner_h);
     let off = max_off.saturating_sub(scrollback); // bottom-anchored minus user scrollback
     // Build from `off` onward only; Paragraph clips the pane bottom, so this shows
     // items[off .. off + visible_rows] without cloning the lines above the window.
     let visible: Vec<Line> = items.iter().skip(off).map(to_line).collect();
-    let p = Paragraph::new(visible).block(block).wrap(Wrap { trim: false });
+    let p = Paragraph::new(visible)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 
@@ -543,7 +636,10 @@ fn render_command(f: &mut ratatui::Frame, area: Rect, app: &App) {
     };
     let block = Block::bordered().title("Shell Command").border_style(style);
     let inner = block.inner(area);
-    f.render_widget(Paragraph::new(format!("/ {}", app.input)).block(block), area);
+    f.render_widget(
+        Paragraph::new(format!("/ {}", app.input)).block(block),
+        area,
+    );
     if focused {
         // Cursor after the "/ " prefix.
         let cx = inner.x + 2 + app.input[..app.cursor].chars().count() as u16;

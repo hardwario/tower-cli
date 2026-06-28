@@ -1,0 +1,15 @@
+# Used by `cross` for ARM-Linux release builds. The serialport crate links against
+# libudev, so the target-arch dev package has to be present inside the cross build
+# container. $CROSS_DEB_ARCH is set by cross (arm64, armhf, ...).
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libudev-dev:$CROSS_DEB_ARCH pkg-config",
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes libudev-dev:$CROSS_DEB_ARCH pkg-config",
+]

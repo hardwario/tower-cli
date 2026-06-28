@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify tag matches Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_ver="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          echo "tag=$tag  cargo=$cargo_ver"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::Tag v$tag does not match Cargo.toml version $cargo_ver"
+            exit 1
+          fi
+
+      # Gate the release on formatting so a lint failure can't ship in a tag
+      # (the build/publish jobs `need` this one). fmt only parses source, so no
+      # libudev/compile is required here.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Create the release as a draft up front so users never see a
+      # half-populated release while the matrix builds are still uploading.
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          generate_release_notes: true
+          body: |
+            ## tower-cli ${{ github.ref_name }}
+
+            Host CLI/TUI for the HARDWARIO TOWER console link — the `tower` binary
+            decodes the framed serial protocol from the
+            [tower firmware](https://github.com/hardwario/tower-firmware) (logs, events,
+            shell), which a plain serial monitor shows only as raw frame bytes.
+
+            ### Install
+            Download the archive for your platform, extract it, and put `tower` on your `PATH`:
+            ```sh
+            tar -xzf tower-${{ github.ref_name }}-<target>.tar.gz   # .zip on Windows
+            sudo mv tower-*/tower /usr/local/bin/                   # macOS / Linux
+            ```
+            Each archive ships with a matching `.sha256` for verification.
+
+            ### Assets
+            | Platform | Target |
+            |----------|--------|
+            | Linux x86_64 | `x86_64-unknown-linux-gnu` |
+            | Linux ARM64 | `aarch64-unknown-linux-gnu` |
+            | Linux ARMv7 (Raspberry Pi) | `armv7-unknown-linux-gnueabihf` |
+            | macOS Intel | `x86_64-apple-darwin` |
+            | macOS Apple Silicon | `aarch64-apple-darwin` |
+            | Windows x86_64 | `x86_64-pc-windows-msvc` |
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Native Linux build needs host libudev; cross builds get it from Cross.toml.
+      - name: Install libudev (native Linux)
+        if: matrix.os == 'ubuntu-latest' && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          staging="tower-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp README.md "$staging/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/tower.exe" "$staging/"
+            7z a "$staging.zip" "$staging" >/dev/null
+            asset="$staging.zip"
+          else
+            cp "target/${{ matrix.target }}/release/tower" "$staging/"
+            tar -czf "$staging.tar.gz" "$staging"
+            asset="$staging.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "checksum=$asset.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+          fail_on_unmatched_files: true
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark release as published
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: false

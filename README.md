@@ -38,8 +38,28 @@ On Windows, extract the `.zip` and put `tower.exe` on your `PATH`.
 
 ```sh
 tower --help          # all commands
+tower --version       # print the tower-cli version
 tower                 # open the TUI console on the detected port
 ```
+
+## Flashing firmware
+
+`tower` can program the device's STM32L0 over its UART bootloader (toggling
+NRST/BOOT0 through the USB-UART bridge), so a separate flashing tool isn't
+needed. The bootloader engine is the [`jolt`](https://github.com/hardwario/jolt)
+crate, integrated as a library:
+
+```sh
+tower flash firmware.bin     # erase, write, verify, then reset into the app
+tower flash firmware.bin --no-verify --no-run
+tower erase                  # erase the whole flash, reset into the app
+tower reset                  # reset into the application
+tower reset --bootloader     # reset into the system bootloader
+```
+
+Firmware must be a raw `.bin` (convert `.elf`/`.hex` with
+`arm-none-eabi-objcopy -O binary in.elf out.bin`). The port is auto-detected when
+exactly one USB serial device is present; otherwise pass `--port`.
 
 ## Build from source
 

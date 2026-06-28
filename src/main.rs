@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ enum View {
 }
 
 #[derive(Parser)]
-#[command(name = "tower", about = "HARDWARIO TOWER console host")]
+#[command(name = "tower", version, about = "HARDWARIO TOWER console host")]
 struct Cli {
     /// Serial port (auto-detected when exactly one USB serial device is present).
     #[arg(short, long, global = true)]
@@ -81,6 +82,38 @@ enum Cmd {
         #[arg(long)]
         hex: bool,
     },
+    /// Flash a raw firmware `.bin` over the STM32 UART bootloader (via jolt).
+    Flash {
+        /// Path to the raw firmware `.bin`.
+        file: PathBuf,
+        /// Skip erasing before writing.
+        #[arg(long)]
+        no_erase: bool,
+        /// Skip read-back verification.
+        #[arg(long)]
+        no_verify: bool,
+        /// Do not reset/jump into the application after flashing.
+        #[arg(long)]
+        no_run: bool,
+        /// Use the bootloader Go command instead of a hardware reset to start the app.
+        #[arg(long)]
+        go: bool,
+        /// Print bootloader connect diagnostics.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Erase the entire device flash over the STM32 UART bootloader (via jolt).
+    Erase {
+        /// Print bootloader connect diagnostics.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Reset the device into the application (default) or the system bootloader.
+    Reset {
+        /// Reset into the system bootloader instead of the application.
+        #[arg(long)]
+        bootloader: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -94,6 +127,16 @@ fn main() -> Result<()> {
         Cmd::Console => tui::run(pick_port(cli.port)?),
         Cmd::Complete { line } => complete_cmd(cli.port, line),
         Cmd::Monitor { hex } => monitor(cli.port, hex),
+        Cmd::Flash {
+            file,
+            no_erase,
+            no_verify,
+            no_run,
+            go,
+            verbose,
+        } => flash_cmd(cli.port, file, !no_erase, !no_verify, !no_run, go, verbose),
+        Cmd::Erase { verbose } => erase_cmd(cli.port, verbose),
+        Cmd::Reset { bootloader } => reset_cmd(cli.port, bootloader),
     }
 }
 
@@ -129,20 +172,11 @@ fn pick_port(explicit: Option<String>) -> Result<String> {
 }
 
 fn devices() -> Result<()> {
+    // tower-cli's own serial enumeration — one bare port name per line, nothing
+    // else (script-friendly). We deliberately don't delegate to jolt's lister.
     let ports = serialport::available_ports().context("listing serial ports")?;
-    if ports.is_empty() {
-        println!("(no serial ports)");
-        return Ok(());
-    }
     for p in ports {
-        let kind = match &p.port_type {
-            serialport::SerialPortType::UsbPort(i) => {
-                let product = i.product.as_deref().unwrap_or("");
-                format!("USB {:04x}:{:04x} {}", i.vid, i.pid, product)
-            }
-            other => format!("{other:?}"),
-        };
-        println!("{:<28} {}", p.port_name, kind.trim());
+        println!("{}", p.port_name);
     }
     Ok(())
 }
@@ -626,4 +660,69 @@ fn hexline(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+// ---- firmware: flash / erase / reset (STM32 UART bootloader, via jolt) -----
+//
+// The console protocol above runs over the firmware's framed UART link; these
+// commands instead drive the STM32 system bootloader (toggling NRST/BOOT0 over
+// the bridge's RTS/DTR). The whole bootloader engine is the `jolt` crate — we
+// only pick the port (reusing the same auto-detect as the other commands) and
+// hand off to it.
+
+fn flash_cmd(
+    port: Option<String>,
+    file: PathBuf,
+    erase: bool,
+    verify: bool,
+    run: bool,
+    go: bool,
+    verbose: bool,
+) -> Result<()> {
+    let port = pick_port(port)?;
+    let fw = jolt::firmware::load(&file)?;
+    if fw.len() as u32 > jolt::target::MAX_FLASH_SIZE {
+        bail!(
+            "firmware is {} bytes, exceeding the {} KiB maximum for any STM32L0 device",
+            fw.len(),
+            jolt::target::MAX_FLASH_SIZE / 1024
+        );
+    }
+    eprintln!(
+        "[tower] flashing {} ({} bytes) to {port}",
+        file.display(),
+        fw.len()
+    );
+    let mut sp = jolt::port::Port::open(&port).with_context(|| format!("opening {port}"))?;
+    let opts = jolt::flash::FlashOptions {
+        erase,
+        verify,
+        run,
+        go,
+        verbose,
+    };
+    jolt::flash::flash(&mut sp, &fw, &opts).context("flashing firmware")
+}
+
+fn erase_cmd(port: Option<String>, verbose: bool) -> Result<()> {
+    let port = pick_port(port)?;
+    eprintln!("[tower] erasing {port}");
+    let mut sp = jolt::port::Port::open(&port).with_context(|| format!("opening {port}"))?;
+    let pages = jolt::flash::erase(&mut sp, verbose).context("erasing flash")?;
+    eprintln!("[tower] erased {pages} page(s), reset into application");
+    Ok(())
+}
+
+fn reset_cmd(port: Option<String>, bootloader: bool) -> Result<()> {
+    let port = pick_port(port)?;
+    let mut sp = jolt::port::Port::open(&port).with_context(|| format!("opening {port}"))?;
+    if bootloader {
+        sp.reset_into_bootloader()
+            .context("resetting into bootloader")?;
+        eprintln!("[tower] {port} reset into bootloader");
+    } else {
+        sp.reset_into_app().context("resetting into application")?;
+        eprintln!("[tower] {port} reset into application");
+    }
+    Ok(())
 }

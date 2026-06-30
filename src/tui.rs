@@ -40,6 +40,8 @@ enum Pane {
 
 struct App {
     port_name: String,
+    /// Reboot the app on the *first* successful open (consumed then), not on reconnects.
+    reset_pending: bool,
     sp: Option<Box<dyn serialport::SerialPort>>,
     dec: FrameDecoder,
     logs: VecDeque<(String, Color)>,
@@ -64,9 +66,10 @@ struct App {
 }
 
 impl App {
-    fn new(port_name: String) -> Self {
+    fn new(port_name: String, reset_pending: bool) -> Self {
         App {
             port_name,
+            reset_pending,
             sp: None,
             dec: FrameDecoder::new(),
             logs: VecDeque::new(),
@@ -103,9 +106,9 @@ fn push_cap<T>(buf: &mut VecDeque<T>, item: T) {
     buf.push_back(item);
 }
 
-pub fn run(port: String) -> Result<()> {
+pub fn run(port: String, reset: bool) -> Result<()> {
     let mut terminal = ratatui::init(); // raw mode + alt screen + panic-restore hook
-    let app = App::new(port);
+    let app = App::new(port, reset);
     let res = run_loop(&mut terminal, app);
     ratatui::restore();
     res
@@ -135,10 +138,17 @@ fn ensure_connected(app: &mut App) {
         return;
     }
     app.last_open_attempt = Instant::now();
-    if let Ok(sp) = serialport::new(&app.port_name, 115_200)
+    if let Ok(mut sp) = serialport::new(&app.port_name, 115_200)
         .timeout(Duration::from_millis(10))
         .open()
     {
+        // Put the lines in the known run state (shared with the other commands); on the
+        // first attach with --reset, reboot the app so its startup is captured here.
+        let _ = crate::set_run_baseline(&mut *sp);
+        if app.reset_pending {
+            let _ = crate::pulse_reset_into_app(&mut *sp);
+            app.reset_pending = false;
+        }
         app.sp = Some(sp);
         app.dec.reset();
     }

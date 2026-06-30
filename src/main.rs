@@ -57,22 +57,48 @@ enum Cmd {
         /// Send this text to the device once on connect (RX probe / quick poke).
         #[arg(long)]
         send: Option<String>,
+        /// Reboot the application on connect (NRST pulse) so you see it come up from the start.
+        #[arg(long)]
+        reset: bool,
+        /// With --reset and --send: extra ms to settle after the boot Hello (or fallback wait if none).
+        #[arg(long, value_name = "MS", requires = "reset")]
+        delay: Option<u64>,
     },
     /// Stream device events (structured key=value) to stdout.
     Events {
         /// Disable ANSI colors.
         #[arg(long)]
         no_colors: bool,
+        /// Reboot the application on connect (NRST pulse) so you see it come up from the start.
+        #[arg(long)]
+        reset: bool,
     },
     /// Open an interactive shell (commands start with `/`).
-    Shell,
+    Shell {
+        /// Reboot the application before the shell opens, waiting for it to come up.
+        #[arg(long)]
+        reset: bool,
+        /// With --reset: extra ms to settle after the boot Hello (or fallback wait if none).
+        #[arg(long, value_name = "MS", requires = "reset")]
+        delay: Option<u64>,
+    },
     /// Run one shell command and print its response, then exit (for scripts / CI).
     Exec {
         /// The command line, e.g. "/system/resource print".
         line: String,
+        /// Reboot the application first, waiting for it to come up before sending (clean CI state).
+        #[arg(long)]
+        reset: bool,
+        /// With --reset: extra ms to settle after the boot Hello (or fallback wait if none).
+        #[arg(long, value_name = "MS", requires = "reset")]
+        delay: Option<u64>,
     },
     /// Open the full-screen TUI console (logs + events + shell).
-    Console,
+    Console {
+        /// Reboot the application on connect (NRST pulse) so you see it come up from the start.
+        #[arg(long)]
+        reset: bool,
+    },
     /// Ask the target to complete a partial command line (target-authoritative).
     Complete {
         /// The partial line (cursor is taken at its end).
@@ -83,6 +109,9 @@ enum Cmd {
         /// Dump raw received bytes as hex instead of decoded frames.
         #[arg(long)]
         hex: bool,
+        /// Reboot the application on connect (NRST pulse) so you capture its startup bytes.
+        #[arg(long)]
+        reset: bool,
     },
     /// Flash a raw firmware `.bin` over the STM32 UART bootloader (via jolt).
     Flash {
@@ -145,13 +174,20 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Devices => devices(),
-        Cmd::Logs { no_colors, send } => stream(cli.port, !no_colors, View::Logs, send),
-        Cmd::Events { no_colors } => stream(cli.port, !no_colors, View::Events, None),
-        Cmd::Shell => shell(cli.port),
-        Cmd::Exec { line } => exec_cmd(cli.port, line),
-        Cmd::Console => tui::run(pick_port(cli.port)?),
+        Cmd::Logs {
+            no_colors,
+            send,
+            reset,
+            delay,
+        } => stream(cli.port, !no_colors, View::Logs, send, reset, delay),
+        Cmd::Events { no_colors, reset } => {
+            stream(cli.port, !no_colors, View::Events, None, reset, None)
+        }
+        Cmd::Shell { reset, delay } => shell(cli.port, reset, delay),
+        Cmd::Exec { line, reset, delay } => exec_cmd(cli.port, line, reset, delay),
+        Cmd::Console { reset } => tui::run(pick_port(cli.port)?, reset),
         Cmd::Complete { line } => complete_cmd(cli.port, line),
-        Cmd::Monitor { hex } => monitor(cli.port, hex),
+        Cmd::Monitor { hex, reset } => monitor(cli.port, hex, reset),
         Cmd::Flash {
             file,
             no_erase,
@@ -216,6 +252,98 @@ fn open(port: &str) -> Result<Box<dyn serialport::SerialPort>> {
         .timeout(Duration::from_millis(200))
         .open()
         .with_context(|| format!("opening {port}"))
+}
+
+// ---- console line control (NRST/BOOT0 over RTS/DTR) -----------------------
+//
+// The AUTHORITATIVE copy of this sequence lives in jolt (jolt/src/port.rs:
+// `open_with` / `reset_into_app`). We duplicate the minimal pulse here so a
+// console command can reset on the *same* handle it streams from and thus
+// capture boot output from the very first byte — reopening the port would drop
+// the `Hello` + early logs and re-undefine the line state. RTS->NRST,
+// DTR->BOOT0; (true,true) is the safe "run" baseline. If the bridge wiring,
+// polarity, or timing ever changes in jolt, mirror the change here.
+const RESET_PULSE: Duration = Duration::from_millis(100);
+const RUN_SETTLE: Duration = Duration::from_millis(50);
+/// How long to wait for the boot `Hello` before falling back to `--delay`.
+const HELLO_WAIT: Duration = Duration::from_millis(1500);
+/// Fallback settle when `--reset` is used on a send path but no `Hello` arrives
+/// and no explicit `--delay` was given.
+const DEFAULT_SETTLE: Duration = Duration::from_millis(250);
+
+/// Drive RTS/DTR to the run baseline so merely opening the port can't leave the
+/// MCU held in reset by whatever level the USB bridge asserts on open. Mirrors
+/// jolt's `open_with`.
+fn set_run_baseline(sp: &mut dyn serialport::SerialPort) -> Result<()> {
+    sp.write_request_to_send(true)?;
+    sp.write_data_terminal_ready(true)?;
+    std::thread::sleep(RUN_SETTLE);
+    Ok(())
+}
+
+/// Pulse NRST to reboot into the application (BOOT0 low), returning the instant
+/// reset is released so the caller can capture boot output from byte 0. Mirrors
+/// jolt's `reset_into_app` minus its post-boot settle (we want the boot logs).
+fn pulse_reset_into_app(sp: &mut dyn serialport::SerialPort) -> Result<()> {
+    sp.write_request_to_send(true)?; // RTS asserted
+    sp.write_data_terminal_ready(false)?; // BOOT0 low -> RESET asserted
+    std::thread::sleep(RESET_PULSE);
+    let _ = sp.clear(serialport::ClearBuffer::Input); // drop pre-reset bytes while held in reset
+    sp.write_request_to_send(false)?; // RESET released -> boot the app
+    Ok(())
+}
+
+/// Open a console port with the lines in a known state. With `reset`, reboot the
+/// application first so the caller observes it coming up from the start.
+fn open_console(port: &str, reset: bool) -> Result<Box<dyn serialport::SerialPort>> {
+    let mut sp = open(port)?;
+    set_run_baseline(&mut *sp)?;
+    if reset {
+        pulse_reset_into_app(&mut *sp)?;
+        eprintln!("[tower] reset into application");
+    }
+    Ok(sp)
+}
+
+/// Block until the device announces itself with a `Hello` frame (so its shell is
+/// up before we send), or `timeout`. Bytes seen meanwhile feed `dec`. Returns
+/// true if `Hello` arrived. Only meaningful right after a reset.
+fn wait_for_hello(
+    sp: &mut dyn serialport::SerialPort,
+    dec: &mut FrameDecoder,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 256];
+    while Instant::now() < deadline {
+        let n = match sp.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
+            Err(_) => return false,
+        };
+        for &b in &buf[..n] {
+            if let Some(inner) = dec.push(b)
+                && matches!(decode_frame(inner), Ok((MsgType::Hello, _, _)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Get a freshly reset device ready to accept a command: wait for the boot
+/// `Hello` (self-calibrating to real boot time), then honor an explicit `--delay`
+/// as extra settle. If no `Hello` arrives, fall back to `--delay` (or a default)
+/// so we don't send into a link that isn't up yet.
+fn await_ready(sp: &mut dyn serialport::SerialPort, dec: &mut FrameDecoder, delay: Option<u64>) {
+    if wait_for_hello(sp, dec, HELLO_WAIT) {
+        if let Some(ms) = delay {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    } else {
+        std::thread::sleep(delay.map_or(DEFAULT_SETTLE, Duration::from_millis));
+    }
 }
 
 // ---- FOTA host-proxy serve ------------------------------------------------
@@ -310,13 +438,28 @@ fn fota_serve_loop(
     }
 }
 
-fn stream(port: Option<String>, colors: bool, view: View, send: Option<String>) -> Result<()> {
+fn stream(
+    port: Option<String>,
+    colors: bool,
+    view: View,
+    send: Option<String>,
+    reset: bool,
+    delay: Option<u64>,
+) -> Result<()> {
     let port = pick_port(port)?;
+    // --reset fires once, on the initial attach — not on every auto-reconnect,
+    // or a flaky link would turn into a reboot loop.
+    let mut first = true;
     loop {
-        match open(&port) {
+        match open_console(&port, reset && first) {
             Ok(mut sp) => {
                 eprintln!("[tower] connected {port}");
                 if let Some(s) = &send {
+                    // On a reset attach, wait for the device to come up before poking it.
+                    if reset && first {
+                        let mut dec = FrameDecoder::new();
+                        await_ready(&mut *sp, &mut dec, delay);
+                    }
                     let _ = sp.write_all(s.as_bytes());
                     let _ = sp.flush();
                     eprintln!("[tower] sent {} byte(s)", s.len());
@@ -327,6 +470,7 @@ fn stream(port: Option<String>, colors: bool, view: View, send: Option<String>) 
             }
             Err(e) => eprintln!("[tower] {e}"),
         }
+        first = false;
         std::thread::sleep(Duration::from_millis(800));
         eprintln!("[tower] reconnecting…");
     }
@@ -508,16 +652,17 @@ impl Highlighter for ShellHelper {}
 impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
 
-fn shell(port: Option<String>) -> Result<()> {
+fn shell(port: Option<String>, reset: bool, delay: Option<u64>) -> Result<()> {
     let port = pick_port(port)?;
-    let sp = open(&port)?;
+    let mut sp = open_console(&port, reset)?;
     eprintln!("[tower] shell on {port} — TAB completes; commands start with '/'; 'exit' to quit");
 
-    let conn = Rc::new(RefCell::new(Conn {
-        sp,
-        dec: FrameDecoder::new(),
-        req_id: 0,
-    }));
+    let mut dec = FrameDecoder::new();
+    if reset {
+        // Don't drop into the prompt until the freshly reset device can answer.
+        await_ready(&mut *sp, &mut dec, delay);
+    }
+    let conn = Rc::new(RefCell::new(Conn { sp, dec, req_id: 0 }));
     let mut rl: Editor<ShellHelper, rustyline::history::DefaultHistory> = Editor::new()?;
     rl.set_helper(Some(ShellHelper { conn: conn.clone() }));
 
@@ -574,10 +719,15 @@ fn shell(port: Option<String>) -> Result<()> {
 
 /// Run a single shell command non-interactively: send it, print the (reassembled)
 /// response, and exit non-zero if the device reports a non-zero result or times out.
-fn exec_cmd(port: Option<String>, line: String) -> Result<()> {
+fn exec_cmd(port: Option<String>, line: String, reset: bool, delay: Option<u64>) -> Result<()> {
     let port = pick_port(port)?;
-    let mut sp = open(&port)?;
+    let mut sp = open_console(&port, reset)?;
     let mut dec = FrameDecoder::new();
+    if reset {
+        // Wait for the reset device to boot before issuing the command, so the
+        // response we capture is from a known-clean state (the CI use case).
+        await_ready(&mut *sp, &mut dec, delay);
+    }
     let mut buf = [0u8; tower_protocol::MAX_WIRE];
     let n = encode_frame(
         MsgType::ShellCommand,
@@ -707,7 +857,9 @@ fn request_completions(
 
 fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
     let port = pick_port(port)?;
-    let mut sp = open(&port)?;
+    // No --reset here (completion is a momentary query), but still establish the
+    // run baseline so we don't query a device the bridge left held in reset.
+    let mut sp = open_console(&port, false)?;
     let mut dec = FrameDecoder::new();
     let cursor = line.len() as u16;
     match request_completions(
@@ -736,9 +888,9 @@ fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
 
 // ---- monitor (transport debugging) ----------------------------------------
 
-fn monitor(port: Option<String>, hex: bool) -> Result<()> {
+fn monitor(port: Option<String>, hex: bool, reset: bool) -> Result<()> {
     let port = pick_port(port)?;
-    let mut sp = open(&port)?;
+    let mut sp = open_console(&port, reset)?;
     eprintln!(
         "[tower] monitoring {port} ({})",
         if hex { "raw hex" } else { "frames" }

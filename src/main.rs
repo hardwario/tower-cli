@@ -503,6 +503,12 @@ fn render(inner: &[u8], colors: bool, view: View, last_seq: &mut Option<u16>) {
             return;
         }
     };
+    // A `Hello` marks a new device session: the firmware resets its per-session `seq`
+    // (the dynamic console re-emits `Hello` on every USB plug-in), so re-baseline our
+    // tracking on it rather than reporting a spurious gap across the reconnect.
+    if matches!(mt, MsgType::Hello) {
+        *last_seq = None;
+    }
     if let Some(prev) = *last_seq {
         let expected = prev.wrapping_add(1);
         if seq != expected {

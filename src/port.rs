@@ -25,8 +25,8 @@ pub(crate) fn usb_ports() -> Vec<String> {
         .collect()
 }
 
-/// Resolve the port to use: the explicit `--port`, else the sole USB serial port. Ambiguity
-/// (zero or several) is an error telling the user to pass `--port`.
+/// Resolve the serial-port path to use: the explicit `--device`, else the sole USB serial
+/// device. Ambiguity (zero or several) is an error telling the user to pass `--device`.
 pub(crate) fn pick_port(explicit: Option<String>) -> Result<String> {
     if let Some(p) = explicit {
         return Ok(p);
@@ -34,9 +34,9 @@ pub(crate) fn pick_port(explicit: Option<String>) -> Result<String> {
     let ports = usb_ports();
     match ports.len() {
         1 => Ok(ports.into_iter().next().unwrap()),
-        0 => bail!("no USB serial port found; pass --port"),
+        0 => bail!("no USB serial device found; pass --device"),
         _ => bail!(
-            "multiple USB serial ports; pass --port (one of: {})",
+            "multiple USB serial devices; pass --device (one of: {})",
             ports.join(", ")
         ),
     }

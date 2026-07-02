@@ -39,7 +39,7 @@ On Windows, extract the `.zip` and put `tower.exe` on your `PATH`.
 ```sh
 tower --help          # all commands
 tower --version       # print the tower-cli version
-tower                 # open the TUI console on the detected port (bare, no subcommand)
+tower                 # open the TUI console on the detected device (bare, no subcommand)
 ```
 
 The streaming commands render the framed link to stdout:
@@ -54,9 +54,12 @@ tower logs --no-reconnect         # exit when the link drops instead of retrying
 ```
 
 Colors default to **auto**: on when stdout is a terminal and `NO_COLOR` is unset,
-off when piped or redirected. The first port open is always fatal (a bad `--port`
+off when piped or redirected. The first device open is always fatal (a bad `--device`
 exits non-zero rather than retrying); reconnection only kicks in after a successful
 attach, and `--no-reconnect` disables it entirely.
+
+The device is selected with `-d`/`--device` (auto-detected when exactly one USB serial
+device is present). List what's connected with `tower devices`.
 
 ### Exit codes
 
@@ -87,8 +90,8 @@ tower reset --bootloader     # reset into the system bootloader
 ```
 
 Firmware must be a raw `.bin` (convert `.elf`/`.hex` with
-`arm-none-eabi-objcopy -O binary in.elf out.bin`). The port is auto-detected when
-exactly one USB serial device is present; otherwise pass `--port`.
+`arm-none-eabi-objcopy -O binary in.elf out.bin`). The device is auto-detected when
+exactly one USB serial device is present; otherwise pass `--device`.
 
 ## Build from source
 

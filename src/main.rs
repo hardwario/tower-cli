@@ -62,8 +62,9 @@ const DEFAULT_TIMEOUT_MS: u64 = 1500;
 #[derive(Parser)]
 #[command(name = "tower", version, about = "HARDWARIO TOWER console host")]
 struct Cli {
-    /// Serial port (auto-detected when exactly one USB serial device is present).
-    #[arg(short, long, global = true)]
+    /// Serial device (auto-detected when exactly one USB serial device is present).
+    // The field stays `port` since it holds a serial-port path; the user-facing flag is `--device`.
+    #[arg(short = 'd', long = "device", value_name = "DEVICE", global = true)]
     port: Option<String>,
     /// Don't auto-reconnect on the streaming commands (`logs`/`events`/`fota serve`):
     /// exit when the link drops instead of retrying. (The first open is always fatal.)
@@ -76,7 +77,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// List available serial ports.
+    /// List connected serial devices.
     Devices,
     /// Stream device logs (and `print!` output) to stdout.
     Logs {
@@ -345,7 +346,7 @@ fn fota_serve(
         image.len(),
         manifest.len()
     );
-    // The FIRST open is fatal: a bad --port or a busy device should exit 1, not spin forever.
+    // The FIRST open is fatal: a bad --device or a busy device should exit 1, not spin forever.
     // Enter the reconnect loop only after one success (and only if reconnection is enabled).
     let mut sp = open_console(&port, false)?;
     loop {
@@ -380,7 +381,7 @@ fn stream(
     reconnect: bool,
 ) -> Result<()> {
     let port = pick_port(port)?;
-    // The FIRST open is fatal: a nonexistent --port must exit 1, not retry forever
+    // The FIRST open is fatal: a nonexistent --device must exit 1, not retry forever
     // (that used to spin silently). Enter the reconnect loop only after one success.
     // --reset fires once, on that initial attach — not on every auto-reconnect, or a
     // flaky link would turn into a reboot loop.

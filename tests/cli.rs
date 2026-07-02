@@ -71,13 +71,13 @@ fn devices_runs_with_no_hardware() {
 #[test]
 fn no_colors_alias_is_accepted_but_hidden() {
     // The deprecated `--no-colors` alias still parses (help hides it). Pair it with an
-    // impossible port so we fail fast on the (now-fatal) open rather than hanging on a real
+    // impossible device so we fail fast on the (now-fatal) open rather than hanging on a real
     // device — the point is only that the *flag* parses, i.e. we don't get a usage error (2).
     tower()
         .args([
             "logs",
             "--no-colors",
-            "--port",
+            "--device",
             "/dev/tower-cli-test-nonexistent",
         ])
         .assert()
@@ -85,11 +85,12 @@ fn no_colors_alias_is_accepted_but_hidden() {
 }
 
 #[test]
-fn nonexistent_port_first_open_is_fatal() {
-    // A bad `--port` must exit 1 (tool error), not spin forever in the reconnect loop.
+fn nonexistent_device_first_open_is_fatal() {
+    // A bad `--device` must exit 1 (tool error), not spin forever in the reconnect loop.
     tower()
-        .args(["logs", "--port", "/dev/tower-cli-test-nonexistent"])
+        .args(["logs", "--device", "/dev/tower-cli-test-nonexistent"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("error"));
 }
+

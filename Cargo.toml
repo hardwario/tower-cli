@@ -3,6 +3,8 @@ name = "tower-cli"
 version = "0.2.0"
 edition = "2024"
 description = "HARDWARIO TOWER console host CLI (`tower`): renders the framed serial link from the tower firmware."
+license = "MIT"
+repository = "https://github.com/hardwario/tower-cli"
 
 [[bin]]
 name = "tower"
@@ -17,6 +19,11 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 postcard = { version = "1", default-features = false }
 serde = "1"
+# `fota serve` validates that the signed manifest actually describes the image it will serve:
+# it recomputes the image digest and checks it against `Manifest::sha256`. The digest is
+# SHA-512 truncated to 256 bits — the exact scheme `firmware/tools/fota-sign::image_digest`
+# and the device bootloader use, so the three agree byte-for-byte.
+sha2 = "0.10"
 # Single source of truth for the wire format, shared with the firmware (which depends on the
 # same crate + tag). postcard isn't self-describing, so both ends MUST be the same version —
 # pinned to a tag so a standalone clone builds reproducibly. Bump in lockstep with any wire
@@ -28,3 +35,19 @@ tower-protocol = { git = "https://github.com/hardwario/tower-protocol", tag = "v
 # tower-protocol above. For side-by-side dev against a local checkout, see the
 # `.cargo/config.toml` `paths` override.
 jolt = { git = "https://github.com/hardwario/jolt", tag = "v1.2.0" }
+
+[dev-dependencies]
+# Tests build wire frames with the protocol's own message types; `ShellCompletions`/`Event`
+# carry `heapless::Vec` fields, so the tests need heapless to construct them. `assert_cmd`
+# drives the compiled `tower` binary end-to-end (help/usage/exit-code contract) with no
+# hardware. Pinned to the same heapless major that tower-protocol resolves.
+heapless = "0.9"
+assert_cmd = "2"
+predicates = "3"
+
+[target.'cfg(unix)'.dependencies]
+# Only used to restore the default SIGPIPE disposition at startup (see main()). Rust's
+# runtime sets SIGPIPE to SIG_IGN, which turns a closed downstream pipe (`tower logs | head`)
+# into an EPIPE that our print!/println! calls unwrap into a panic. Restoring SIG_DFL makes
+# the process die quietly on the signal, matching every other Unix CLI.
+libc = "0.2"

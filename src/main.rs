@@ -8,8 +8,9 @@
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -19,21 +20,44 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
-use tower_protocol::msg::{
-    CandidateKind, Dropped, Event, Hello, Level, Log, Print, ShellCommand, ShellComplete,
-    ShellCompletions, ShellResponse,
-};
-use tower_protocol::fota::{FOTA_MANIFEST_OFFSET, SIGNED_LEN};
-use tower_protocol::{FrameDecoder, MAX_WIRE, MsgType, decode_frame, encode_frame, encode_frame_raw};
+use tower_protocol::msg::{CandidateKind, ShellCommand};
+use tower_protocol::{FrameDecoder, MsgType, decode_frame, encode_frame};
 
+mod port;
+mod render;
+mod session;
 mod tui;
 
-/// Which entity stream to render.
-#[derive(Clone, Copy, PartialEq)]
-enum View {
-    Logs,
-    Events,
-}
+use port::{devices, open_console, pick_port};
+use render::{
+    ColorMode, OutputMode, View, hexline, read_loop, resolve_color, warn_protocol_mismatch,
+};
+use session::{
+    await_ready, fota_serve_loop, read_response, request_completions, validate_manifest,
+};
+
+// ---- exit-code contract ---------------------------------------------------
+//
+// A documented, stable exit-code contract so scripts/CI can branch on *why* a
+// command failed, not just that it did. `main` returns an `ExitCode` built from
+// these; commands surface failures as `Err` (→ EXIT_ERROR) or return one of the
+// specific codes below. `exec` additionally forwards a device-reported non-zero
+// `result` verbatim (1..=123), which is why the reserved codes start at 124.
+//
+//   0    ok
+//   1    tool error (I/O, bad file, encode/decode, protocol mismatch)
+//   2    usage error (bad args — emitted by clap itself)
+//   124  device command timed out (no/incomplete response)
+//
+// So a device `result` can't be confused with the reserved 124, `exec` clamps a
+// device-reported non-zero result into 1..=123 (see `exec_cmd`).
+const EXIT_OK: u8 = 0;
+const EXIT_ERROR: u8 = 1;
+const EXIT_DEVICE_TIMEOUT: u8 = 124;
+
+/// Default per-command response timeout (`--timeout`), in milliseconds. Long enough
+/// for a slow device print, short enough that a wedged link fails a script promptly.
+const DEFAULT_TIMEOUT_MS: u64 = 1500;
 
 #[derive(Parser)]
 #[command(name = "tower", version, about = "HARDWARIO TOWER console host")]
@@ -41,8 +65,13 @@ struct Cli {
     /// Serial port (auto-detected when exactly one USB serial device is present).
     #[arg(short, long, global = true)]
     port: Option<String>,
+    /// Don't auto-reconnect on the streaming commands (`logs`/`events`/`fota serve`):
+    /// exit when the link drops instead of retrying. (The first open is always fatal.)
+    #[arg(long, global = true)]
+    no_reconnect: bool,
+    /// No subcommand opens the console TUI (the documented bare-`tower` UX).
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -51,9 +80,15 @@ enum Cmd {
     Devices,
     /// Stream device logs (and `print!` output) to stdout.
     Logs {
-        /// Disable ANSI colors.
-        #[arg(long)]
+        /// When to colorize output.
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+        /// Disable ANSI colors (deprecated alias for `--color never`).
+        #[arg(long, hide = true)]
         no_colors: bool,
+        /// Emit one JSON object per line (NDJSON) instead of formatted text.
+        #[arg(long)]
+        json: bool,
         /// Send this text to the device once on connect (RX probe / quick poke).
         #[arg(long)]
         send: Option<String>,
@@ -66,9 +101,15 @@ enum Cmd {
     },
     /// Stream device events (structured key=value) to stdout.
     Events {
-        /// Disable ANSI colors.
-        #[arg(long)]
+        /// When to colorize output.
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+        /// Disable ANSI colors (deprecated alias for `--color never`).
+        #[arg(long, hide = true)]
         no_colors: bool,
+        /// Emit one JSON object per line (NDJSON) instead of formatted text.
+        #[arg(long)]
+        json: bool,
         /// Reboot the application on connect (NRST pulse) so you see it come up from the start.
         #[arg(long)]
         reset: bool,
@@ -81,6 +122,9 @@ enum Cmd {
         /// With --reset: extra ms to settle after the boot Hello (or fallback wait if none).
         #[arg(long, value_name = "MS", requires = "reset")]
         delay: Option<u64>,
+        /// Per-command idle response timeout in ms (reset each time a matching chunk arrives).
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_TIMEOUT_MS)]
+        timeout: u64,
     },
     /// Run one shell command and print its response, then exit (for scripts / CI).
     Exec {
@@ -92,6 +136,9 @@ enum Cmd {
         /// With --reset: extra ms to settle after the boot Hello (or fallback wait if none).
         #[arg(long, value_name = "MS", requires = "reset")]
         delay: Option<u64>,
+        /// Idle response timeout in ms (reset each time a matching chunk arrives).
+        #[arg(long, value_name = "MS", default_value_t = DEFAULT_TIMEOUT_MS)]
+        timeout: u64,
     },
     /// Open the full-screen TUI console (logs + events + shell).
     Console {
@@ -170,24 +217,77 @@ enum FotaCmd {
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Devices => devices(),
+fn main() -> ExitCode {
+    // Rust's runtime installs SIG_IGN for SIGPIPE, so writing to a closed downstream pipe
+    // (`tower logs | head`) surfaces as an EPIPE that print!/println! unwrap into a panic
+    // (exit 101, "failed printing to stdout: Broken pipe"). Restore the default disposition
+    // so we die quietly on the signal like every other Unix filter. No-op on non-unix.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
+    match run(Cli::parse()) {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            eprintln!("[tower] error: {e:#}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+/// Dispatch a parsed command. Returns the process exit code (see the exit-code contract
+/// above); an `Err` here becomes `EXIT_ERROR`. A bare `tower` (no subcommand) opens the TUI.
+fn run(cli: Cli) -> Result<u8> {
+    let reconnect = !cli.no_reconnect;
+    match cli.cmd.unwrap_or(Cmd::Console { reset: false }) {
+        Cmd::Devices => devices().map(|()| EXIT_OK),
         Cmd::Logs {
+            color,
             no_colors,
+            json,
             send,
             reset,
             delay,
-        } => stream(cli.port, !no_colors, View::Logs, send, reset, delay),
-        Cmd::Events { no_colors, reset } => {
-            stream(cli.port, !no_colors, View::Events, None, reset, None)
-        }
-        Cmd::Shell { reset, delay } => shell(cli.port, reset, delay),
-        Cmd::Exec { line, reset, delay } => exec_cmd(cli.port, line, reset, delay),
-        Cmd::Console { reset } => tui::run(pick_port(cli.port)?, reset),
-        Cmd::Complete { line } => complete_cmd(cli.port, line),
-        Cmd::Monitor { hex, reset } => monitor(cli.port, hex, reset),
+        } => stream(
+            cli.port,
+            output_mode(color, no_colors, json),
+            View::Logs,
+            send,
+            reset,
+            delay,
+            reconnect,
+        )
+        .map(|()| EXIT_OK),
+        Cmd::Events {
+            color,
+            no_colors,
+            json,
+            reset,
+        } => stream(
+            cli.port,
+            output_mode(color, no_colors, json),
+            View::Events,
+            None,
+            reset,
+            None,
+            reconnect,
+        )
+        .map(|()| EXIT_OK),
+        Cmd::Shell {
+            reset,
+            delay,
+            timeout,
+        } => shell(cli.port, reset, delay, Duration::from_millis(timeout)).map(|()| EXIT_OK),
+        Cmd::Exec {
+            line,
+            reset,
+            delay,
+            timeout,
+        } => exec_cmd(cli.port, line, reset, delay, Duration::from_millis(timeout)),
+        Cmd::Console { reset } => tui::run(pick_port(cli.port)?, reset).map(|()| EXIT_OK),
+        Cmd::Complete { line } => complete_cmd(cli.port, line).map(|()| EXIT_OK),
+        Cmd::Monitor { hex, reset } => monitor(cli.port, hex, reset).map(|()| EXIT_OK),
         Cmd::Flash {
             file,
             no_erase,
@@ -195,154 +295,28 @@ fn main() -> Result<()> {
             no_run,
             go,
             verbose,
-        } => flash_cmd(cli.port, file, !no_erase, !no_verify, !no_run, go, verbose),
-        Cmd::Erase { verbose } => erase_cmd(cli.port, verbose),
-        Cmd::Reset { bootloader } => reset_cmd(cli.port, bootloader),
+        } => {
+            flash_cmd(cli.port, file, !no_erase, !no_verify, !no_run, go, verbose).map(|()| EXIT_OK)
+        }
+        Cmd::Erase { verbose } => erase_cmd(cli.port, verbose).map(|()| EXIT_OK),
+        Cmd::Reset { bootloader } => reset_cmd(cli.port, bootloader).map(|()| EXIT_OK),
         Cmd::Fota { cmd } => match cmd {
-            FotaCmd::Serve { image, manifest } => fota_serve(cli.port, image, manifest),
+            FotaCmd::Serve { image, manifest } => {
+                fota_serve(cli.port, image, manifest, reconnect).map(|()| EXIT_OK)
+            }
         },
     }
 }
 
-// ---- port selection -------------------------------------------------------
-
-fn usb_ports() -> Vec<String> {
-    serialport::available_ports()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| {
-            matches!(p.port_type, serialport::SerialPortType::UsbPort(_))
-                || p.port_name.contains("usbserial")
-                || p.port_name.contains("ttyUSB")
-                || p.port_name.contains("ttyACM")
-        })
-        .map(|p| p.port_name)
-        .collect()
-}
-
-fn pick_port(explicit: Option<String>) -> Result<String> {
-    if let Some(p) = explicit {
-        return Ok(p);
-    }
-    let ports = usb_ports();
-    match ports.len() {
-        1 => Ok(ports.into_iter().next().unwrap()),
-        0 => bail!("no USB serial port found; pass --port"),
-        _ => bail!(
-            "multiple USB serial ports; pass --port (one of: {})",
-            ports.join(", ")
-        ),
-    }
-}
-
-fn devices() -> Result<()> {
-    // tower-cli's own serial enumeration — one bare port name per line, nothing
-    // else (script-friendly). We deliberately don't delegate to jolt's lister.
-    let ports = serialport::available_ports().context("listing serial ports")?;
-    for p in ports {
-        println!("{}", p.port_name);
-    }
-    Ok(())
-}
-
-// ---- logs (with reconnect) ------------------------------------------------
-
-fn open(port: &str) -> Result<Box<dyn serialport::SerialPort>> {
-    serialport::new(port, 115_200)
-        .timeout(Duration::from_millis(200))
-        .open()
-        .with_context(|| format!("opening {port}"))
-}
-
-// ---- console line control (NRST/BOOT0 over RTS/DTR) -----------------------
-//
-// The AUTHORITATIVE copy of this sequence lives in jolt (jolt/src/port.rs:
-// `open_with` / `reset_into_app`). We duplicate the minimal pulse here so a
-// console command can reset on the *same* handle it streams from and thus
-// capture boot output from the very first byte — reopening the port would drop
-// the `Hello` + early logs and re-undefine the line state. RTS->NRST,
-// DTR->BOOT0; (true,true) is the safe "run" baseline. If the bridge wiring,
-// polarity, or timing ever changes in jolt, mirror the change here.
-const RESET_PULSE: Duration = Duration::from_millis(100);
-const RUN_SETTLE: Duration = Duration::from_millis(50);
-/// How long to wait for the boot `Hello` before falling back to `--delay`.
-const HELLO_WAIT: Duration = Duration::from_millis(1500);
-/// Fallback settle when `--reset` is used on a send path but no `Hello` arrives
-/// and no explicit `--delay` was given.
-const DEFAULT_SETTLE: Duration = Duration::from_millis(250);
-
-/// Drive RTS/DTR to the run baseline so merely opening the port can't leave the
-/// MCU held in reset by whatever level the USB bridge asserts on open. Mirrors
-/// jolt's `open_with`.
-fn set_run_baseline(sp: &mut dyn serialport::SerialPort) -> Result<()> {
-    sp.write_request_to_send(true)?;
-    sp.write_data_terminal_ready(true)?;
-    std::thread::sleep(RUN_SETTLE);
-    Ok(())
-}
-
-/// Pulse NRST to reboot into the application (BOOT0 low), returning the instant
-/// reset is released so the caller can capture boot output from byte 0. Mirrors
-/// jolt's `reset_into_app` minus its post-boot settle (we want the boot logs).
-fn pulse_reset_into_app(sp: &mut dyn serialport::SerialPort) -> Result<()> {
-    sp.write_request_to_send(true)?; // RTS asserted
-    sp.write_data_terminal_ready(false)?; // BOOT0 low -> RESET asserted
-    std::thread::sleep(RESET_PULSE);
-    let _ = sp.clear(serialport::ClearBuffer::Input); // drop pre-reset bytes while held in reset
-    sp.write_request_to_send(false)?; // RESET released -> boot the app
-    Ok(())
-}
-
-/// Open a console port with the lines in a known state. With `reset`, reboot the
-/// application first so the caller observes it coming up from the start.
-fn open_console(port: &str, reset: bool) -> Result<Box<dyn serialport::SerialPort>> {
-    let mut sp = open(port)?;
-    set_run_baseline(&mut *sp)?;
-    if reset {
-        pulse_reset_into_app(&mut *sp)?;
-        eprintln!("[tower] reset into application");
-    }
-    Ok(sp)
-}
-
-/// Block until the device announces itself with a `Hello` frame (so its shell is
-/// up before we send), or `timeout`. Bytes seen meanwhile feed `dec`. Returns
-/// true if `Hello` arrived. Only meaningful right after a reset.
-fn wait_for_hello(
-    sp: &mut dyn serialport::SerialPort,
-    dec: &mut FrameDecoder,
-    timeout: Duration,
-) -> bool {
-    let deadline = Instant::now() + timeout;
-    let mut buf = [0u8; 256];
-    while Instant::now() < deadline {
-        let n = match sp.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
-            Err(_) => return false,
-        };
-        for &b in &buf[..n] {
-            if let Some(inner) = dec.push(b)
-                && matches!(decode_frame(inner), Ok((MsgType::Hello, _, _)))
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Get a freshly reset device ready to accept a command: wait for the boot
-/// `Hello` (self-calibrating to real boot time), then honor an explicit `--delay`
-/// as extra settle. If no `Hello` arrives, fall back to `--delay` (or a default)
-/// so we don't send into a link that isn't up yet.
-fn await_ready(sp: &mut dyn serialport::SerialPort, dec: &mut FrameDecoder, delay: Option<u64>) {
-    if wait_for_hello(sp, dec, HELLO_WAIT) {
-        if let Some(ms) = delay {
-            std::thread::sleep(Duration::from_millis(ms));
-        }
+/// Build the streaming output mode: `--json` wins (structured NDJSON); otherwise text with
+/// color resolved from `--color`/`--no-colors`.
+fn output_mode(color: ColorMode, no_colors: bool, json: bool) -> OutputMode {
+    if json {
+        OutputMode::Json
     } else {
-        std::thread::sleep(delay.map_or(DEFAULT_SETTLE, Duration::from_millis));
+        OutputMode::Text {
+            colors: resolve_color(color, no_colors),
+        }
     }
 }
 
@@ -352,87 +326,45 @@ fn await_ready(sp: &mut dyn serialport::SerialPort, dec: &mut FrameDecoder, dela
 /// image + manifest once, then answer each `FotaReq{offset,len}` frame with a `FotaData`
 /// frame (the manifest for the sentinel offset, image bytes otherwise). The gateway relays
 /// the bytes to the node over the radio; the node's bootloader verifies signature + hash
-/// before swapping. Reconnects if the gateway resets. Runs until interrupted.
-fn fota_serve(port: Option<String>, image_path: PathBuf, manifest_path: PathBuf) -> Result<()> {
+/// before swapping. Reconnects if the gateway resets (unless `reconnect` is false). Runs
+/// until interrupted.
+fn fota_serve(
+    port: Option<String>,
+    image_path: PathBuf,
+    manifest_path: PathBuf,
+    reconnect: bool,
+) -> Result<()> {
     let image = std::fs::read(&image_path)
         .with_context(|| format!("reading image {}", image_path.display()))?;
     let manifest = std::fs::read(&manifest_path)
         .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
-    if manifest.len() != SIGNED_LEN {
-        bail!(
-            "manifest must be {SIGNED_LEN} bytes (a `fota-sign` .fmanifest), got {}",
-            manifest.len()
-        );
-    }
+    validate_manifest(&image, &manifest)?;
     let port = pick_port(port)?;
     eprintln!(
-        "[tower] fota serve: image {} B + manifest {} B; answering FotaReq on {port}",
+        "[tower] fota serve: image {} B + manifest {} B (validated); answering FotaReq on {port}",
         image.len(),
         manifest.len()
     );
+    // The FIRST open is fatal: a bad --port or a busy device should exit 1, not spin forever.
+    // Enter the reconnect loop only after one success (and only if reconnection is enabled).
+    let mut sp = open_console(&port, false)?;
     loop {
-        match open(&port) {
-            Ok(mut sp) => {
-                eprintln!("[tower] connected {port}");
-                if let Err(e) = fota_serve_loop(&mut *sp, &image, &manifest) {
-                    eprintln!("[tower] {port} lost: {e}");
-                }
-            }
-            Err(e) => eprintln!("[tower] {e}"),
+        eprintln!("[tower] connected {port}");
+        if let Err(e) = fota_serve_loop(&mut *sp, &image, &manifest) {
+            eprintln!("[tower] {port} lost: {e}");
+        }
+        if !reconnect {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(800));
         eprintln!("[tower] reconnecting…");
-    }
-}
-
-fn fota_serve_loop(
-    sp: &mut dyn serialport::SerialPort,
-    image: &[u8],
-    manifest: &[u8],
-) -> Result<()> {
-    let mut dec = FrameDecoder::new();
-    let mut rbuf = [0u8; 512];
-    let mut seq: u16 = 0;
-    let mut served_to = 0usize; // high-water of image bytes served, for the progress line
-    loop {
-        let n = match sp.read(&mut rbuf) {
-            Ok(0) => continue,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        };
-        for &b in &rbuf[..n] {
-            let Some(inner) = dec.push(b) else { continue };
-            let Ok((MsgType::FotaReq, _seq, p)) = decode_frame(inner) else { continue };
-            if p.len() < 6 {
+        // Re-establish the run baseline on every reopen (like every other command) so the
+        // bridge can't leave the gateway held in reset. Tolerate a failed reopen and retry.
+        match open_console(&port, false) {
+            Ok(reopened) => sp = reopened,
+            Err(e) => {
+                eprintln!("[tower] {e}");
                 continue;
-            }
-            let offset = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-            let len = u16::from_le_bytes([p[4], p[5]]) as usize;
-
-            // FotaData payload: offset (echoed) ‖ bytes.
-            let mut payload = Vec::with_capacity(4 + len);
-            payload.extend_from_slice(&offset.to_le_bytes());
-            if offset == FOTA_MANIFEST_OFFSET {
-                payload.extend_from_slice(manifest);
-                eprintln!("[tower] -> manifest ({} B)", manifest.len());
-            } else {
-                let start = (offset as usize).min(image.len());
-                let end = (start + len).min(image.len());
-                payload.extend_from_slice(&image[start..end]);
-                served_to = served_to.max(end);
-                eprint!("\r[tower] serving {served_to}/{} B", image.len());
-                let _ = std::io::stderr().flush();
-            }
-
-            let mut frame = [0u8; MAX_WIRE];
-            match encode_frame_raw(MsgType::FotaData, seq, &payload, &mut frame) {
-                Ok(fn_len) => {
-                    sp.write_all(&frame[..fn_len])?;
-                    sp.flush()?;
-                    seq = seq.wrapping_add(1);
-                }
-                Err(e) => eprintln!("\n[tower] encode FotaData failed: {e:?}"),
             }
         }
     }
@@ -440,156 +372,49 @@ fn fota_serve_loop(
 
 fn stream(
     port: Option<String>,
-    colors: bool,
+    mode: OutputMode,
     view: View,
     send: Option<String>,
     reset: bool,
     delay: Option<u64>,
+    reconnect: bool,
 ) -> Result<()> {
     let port = pick_port(port)?;
-    // --reset fires once, on the initial attach — not on every auto-reconnect,
-    // or a flaky link would turn into a reboot loop.
+    // The FIRST open is fatal: a nonexistent --port must exit 1, not retry forever
+    // (that used to spin silently). Enter the reconnect loop only after one success.
+    // --reset fires once, on that initial attach — not on every auto-reconnect, or a
+    // flaky link would turn into a reboot loop.
+    let mut sp = open_console(&port, reset)?;
     let mut first = true;
     loop {
-        match open_console(&port, reset && first) {
-            Ok(mut sp) => {
-                eprintln!("[tower] connected {port}");
-                if let Some(s) = &send {
-                    // On a reset attach, wait for the device to come up before poking it.
-                    if reset && first {
-                        let mut dec = FrameDecoder::new();
-                        await_ready(&mut *sp, &mut dec, delay);
-                    }
-                    let _ = sp.write_all(s.as_bytes());
-                    let _ = sp.flush();
-                    eprintln!("[tower] sent {} byte(s)", s.len());
-                }
-                if let Err(e) = read_loop(&mut *sp, colors, view) {
-                    eprintln!("[tower] {port} lost: {e}");
-                }
+        eprintln!("[tower] connected {port}");
+        if let Some(s) = &send {
+            // On a reset attach, wait for the device to come up before poking it.
+            if reset && first {
+                let mut dec = FrameDecoder::new();
+                await_ready(&mut *sp, &mut dec, delay);
             }
-            Err(e) => eprintln!("[tower] {e}"),
+            let _ = sp.write_all(s.as_bytes());
+            let _ = sp.flush();
+            eprintln!("[tower] sent {} byte(s)", s.len());
+        }
+        if let Err(e) = read_loop(&mut *sp, mode, view) {
+            eprintln!("[tower] {port} lost: {e}");
         }
         first = false;
+        if !reconnect {
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(800));
         eprintln!("[tower] reconnecting…");
-    }
-}
-
-fn read_loop(sp: &mut dyn serialport::SerialPort, colors: bool, view: View) -> Result<()> {
-    let mut dec = FrameDecoder::new();
-    let mut buf = [0u8; 512];
-    let mut last_seq: Option<u16> = None;
-    loop {
-        let n = match sp.read(&mut buf) {
-            Ok(0) => continue,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        };
-        for &b in &buf[..n] {
-            if let Some(inner) = dec.push(b) {
-                render(inner, colors, view, &mut last_seq);
+        // Reopen without re-resetting; tolerate a transient failure and keep retrying.
+        match open_console(&port, false) {
+            Ok(reopened) => sp = reopened,
+            Err(e) => {
+                eprintln!("[tower] {e}");
+                continue;
             }
         }
-    }
-}
-
-fn render(inner: &[u8], colors: bool, view: View, last_seq: &mut Option<u16>) {
-    let (mt, seq, payload) = match decode_frame(inner) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[tower] dropped a corrupt frame: {e:?}");
-            return;
-        }
-    };
-    // A `Hello` marks a new device session: the firmware resets its per-session `seq`
-    // (the dynamic console re-emits `Hello` on every USB plug-in), so re-baseline our
-    // tracking on it rather than reporting a spurious gap across the reconnect.
-    if matches!(mt, MsgType::Hello) {
-        *last_seq = None;
-    }
-    if let Some(prev) = *last_seq {
-        let expected = prev.wrapping_add(1);
-        if seq != expected {
-            eprintln!("[tower] seq gap: expected {expected}, got {seq}");
-        }
-    }
-    *last_seq = Some(seq);
-
-    match mt {
-        MsgType::Hello => {
-            if let Ok(h) = postcard::from_bytes::<Hello>(payload) {
-                eprintln!(
-                    "[tower] hello: firmware {:?}, protocol v{}",
-                    h.firmware_version, h.protocol_version
-                );
-            }
-        }
-        MsgType::Log if view == View::Logs => {
-            if let Ok(l) = postcard::from_bytes::<Log>(payload) {
-                print_log(&l, colors);
-            }
-        }
-        MsgType::Print if view == View::Logs => {
-            if let Ok(p) = postcard::from_bytes::<Print>(payload) {
-                print!("{}", p.text);
-                let _ = std::io::stdout().flush();
-            }
-        }
-        MsgType::Dropped if view == View::Logs => {
-            if let Ok(d) = postcard::from_bytes::<Dropped>(payload) {
-                eprintln!(
-                    "{} {} log frame(s) dropped (device queue full)",
-                    paint("⚠", 33, colors),
-                    d.count
-                );
-            }
-        }
-        MsgType::Event if view == View::Events => {
-            if let Ok(e) = postcard::from_bytes::<Event>(payload) {
-                print_event(&e, colors);
-            }
-        }
-        _ => {} // frames not relevant to this view (or later-phase types)
-    }
-}
-
-fn print_log(l: &Log, colors: bool) {
-    let now = chrono::Local::now().format("%H:%M:%S%.3f");
-    let secs = l.uptime_us / 1_000_000;
-    let ms = (l.uptime_us % 1_000_000) / 1_000;
-    let (label, code) = match l.level {
-        Level::Error => ("ERROR", 31),
-        Level::Warn => ("WARN ", 33),
-        Level::Info => ("INFO ", 32),
-        Level::Debug => ("DEBUG", 36),
-        Level::Trace => ("TRACE", 90),
-    };
-    println!(
-        "{now} [{secs:>5}.{ms:03}] {} {}: {}",
-        paint(label, code, colors),
-        l.module,
-        l.message
-    );
-}
-
-fn print_event(e: &Event, colors: bool) {
-    let now = chrono::Local::now().format("%H:%M:%S%.3f");
-    let fields: Vec<String> = e.fields.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    println!(
-        "{now} {} {}  {}",
-        paint("EVENT", 35, colors),
-        e.name,
-        fields.join(" ")
-    );
-}
-
-fn paint(s: &str, code: u8, colors: bool) -> String {
-    if colors {
-        format!("\x1b[{code}m{s}\x1b[0m")
-    } else {
-        s.to_string()
     }
 }
 
@@ -658,7 +483,7 @@ impl Highlighter for ShellHelper {}
 impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
 
-fn shell(port: Option<String>, reset: bool, delay: Option<u64>) -> Result<()> {
+fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duration) -> Result<()> {
     let port = pick_port(port)?;
     let mut sp = open_console(&port, reset)?;
     eprintln!("[tower] shell on {port} — TAB completes; commands start with '/'; 'exit' to quit");
@@ -699,14 +524,14 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>) -> Result<()> {
                 seq = seq.wrapping_add(1);
                 sp.write_all(&buf[..n])?;
                 sp.flush()?;
-                match read_response(&mut **sp, dec, cmd_id, Duration::from_millis(1500)) {
-                    Some((result, text)) => {
-                        print!("{text}");
-                        if !text.is_empty() && !text.ends_with('\n') {
+                match read_response(&mut **sp, dec, cmd_id, timeout) {
+                    Some(r) => {
+                        print!("{}", r.text);
+                        if !r.text.is_empty() && !r.text.ends_with('\n') {
                             println!();
                         }
-                        if result != 0 {
-                            eprintln!("[result {result}]");
+                        if r.result != 0 {
+                            eprintln!("[result {}]", r.result);
                         }
                     }
                     None => eprintln!("[tower] no response (timeout)"),
@@ -714,25 +539,43 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>) -> Result<()> {
                 cmd_id = cmd_id.wrapping_add(1);
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
-            Err(e) => {
-                eprintln!("[tower] {e}");
-                break;
-            }
+            // A real readline failure (e.g. a broken terminal) is an error, not a clean
+            // exit — propagate it so the shell exits non-zero rather than swallowing it.
+            Err(e) => return Err(anyhow::Error::new(e).context("readline")),
         }
     }
     Ok(())
 }
 
 /// Run a single shell command non-interactively: send it, print the (reassembled)
-/// response, and exit non-zero if the device reports a non-zero result or times out.
-fn exec_cmd(port: Option<String>, line: String, reset: bool, delay: Option<u64>) -> Result<()> {
+/// response, and return an exit code (see the exit-code contract): a device-reported
+/// non-zero `result` (clamped into 1..=123 so it can't collide with our reserved 124),
+/// `EXIT_ERROR` on a truncated (chunk-dropped) response, `EXIT_DEVICE_TIMEOUT` on no/
+/// incomplete reply, else `EXIT_OK`.
+fn exec_cmd(
+    port: Option<String>,
+    line: String,
+    reset: bool,
+    delay: Option<u64>,
+    timeout: Duration,
+) -> Result<u8> {
     let port = pick_port(port)?;
     let mut sp = open_console(&port, reset)?;
     let mut dec = FrameDecoder::new();
     if reset {
         // Wait for the reset device to boot before issuing the command, so the
         // response we capture is from a known-clean state (the CI use case).
-        await_ready(&mut *sp, &mut dec, delay);
+        // Fail fast on a protocol-version mismatch: `exec` feeds CI, and a mismatch means
+        // every subsequent frame silently mis-decodes — better a clear error than junk.
+        if let Some(v) = await_ready(&mut *sp, &mut dec, delay)
+            && v != tower_protocol::PROTOCOL_VERSION
+        {
+            warn_protocol_mismatch(v);
+            bail!(
+                "protocol version mismatch (device v{v}, tower v{}) — refusing to exec",
+                tower_protocol::PROTOCOL_VERSION
+            );
+        }
     }
     let mut buf = [0u8; tower_protocol::MAX_WIRE];
     let n = encode_frame(
@@ -747,118 +590,31 @@ fn exec_cmd(port: Option<String>, line: String, reset: bool, delay: Option<u64>)
     .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
     sp.write_all(&buf[..n])?;
     sp.flush()?;
-    match read_response(&mut *sp, &mut dec, 1, Duration::from_millis(1500)) {
-        Some((result, text)) => {
-            print!("{text}");
-            if !text.is_empty() && !text.ends_with('\n') {
+    match read_response(&mut *sp, &mut dec, 1, timeout) {
+        Some(r) => {
+            print!("{}", r.text);
+            if !r.text.is_empty() && !r.text.ends_with('\n') {
                 println!();
             }
-            if result != 0 {
-                eprintln!("[result {result}]");
-                std::process::exit(i32::from(result));
+            if r.incomplete {
+                // Output was silently truncated by a dropped chunk — fail even if the
+                // device's `last` chunk said result 0 (the reported result is unreliable).
+                eprintln!("[tower] response incomplete");
+                return Ok(EXIT_ERROR);
             }
-            Ok(())
+            if r.result != 0 {
+                eprintln!("[result {}]", r.result);
+                // Device results share the byte with our exit code; keep them in 1..=123 so
+                // they never masquerade as the reserved timeout (124) code.
+                return Ok(r.result.clamp(1, 123));
+            }
+            Ok(EXIT_OK)
         }
-        None => bail!("no response (timeout)"),
-    }
-}
-
-/// Read frames until the `ShellResponse` for `cmd_id` completes (`last`), or timeout.
-/// Non-matching frames (logs/events) are ignored.
-fn read_response(
-    sp: &mut dyn serialport::SerialPort,
-    dec: &mut FrameDecoder,
-    cmd_id: u16,
-    timeout: Duration,
-) -> Option<(u8, String)> {
-    let deadline = Instant::now() + timeout;
-    let mut text = String::new();
-    let mut buf = [0u8; 256];
-    while Instant::now() < deadline {
-        let nread = match sp.read(&mut buf) {
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
-            Err(_) => return None,
-        };
-        for &b in &buf[..nread] {
-            if let Some(inner) = dec.push(b)
-                && let Ok((MsgType::ShellResponse, _, payload)) = decode_frame(inner)
-                && let Ok(r) = postcard::from_bytes::<ShellResponse>(payload)
-                && r.cmd_id == cmd_id
-            {
-                text.push_str(r.text);
-                if r.last {
-                    return Some((r.result, text));
-                }
-            }
+        None => {
+            eprintln!("[tower] no response (timeout)");
+            Ok(EXIT_DEVICE_TIMEOUT)
         }
     }
-    None
-}
-
-// ---- completion (target-authoritative) ------------------------------------
-
-/// An owned copy of a completion result (the wire form borrows the frame buffer).
-struct CompletionResult {
-    token_start: u16,
-    common_prefix: String,
-    candidates: Vec<(String, CandidateKind)>,
-    more: bool,
-}
-
-/// Send a `ShellComplete` and wait for the matching `ShellCompletions`. Shared by the
-/// `complete` command and (later) the interactive TAB handler.
-fn request_completions(
-    sp: &mut dyn serialport::SerialPort,
-    dec: &mut FrameDecoder,
-    line: &str,
-    cursor: u16,
-    req_id: u16,
-    timeout: Duration,
-) -> Option<CompletionResult> {
-    let mut buf = [0u8; tower_protocol::MAX_WIRE];
-    let n = encode_frame(
-        MsgType::ShellComplete,
-        0,
-        &ShellComplete {
-            req_id,
-            line,
-            cursor,
-        },
-        &mut buf,
-    )
-    .ok()?;
-    sp.write_all(&buf[..n]).ok()?;
-    sp.flush().ok()?;
-
-    let deadline = Instant::now() + timeout;
-    let mut rbuf = [0u8; 256];
-    while Instant::now() < deadline {
-        let nread = match sp.read(&mut rbuf) {
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
-            Err(_) => return None,
-        };
-        for &b in &rbuf[..nread] {
-            if let Some(inner) = dec.push(b)
-                && let Ok((MsgType::ShellCompletions, _, payload)) = decode_frame(inner)
-                && let Ok(c) = postcard::from_bytes::<ShellCompletions>(payload)
-                && c.req_id == req_id
-            {
-                return Some(CompletionResult {
-                    token_start: c.token_start,
-                    common_prefix: c.common_prefix.to_string(),
-                    candidates: c
-                        .candidates
-                        .iter()
-                        .map(|cd| (cd.text.to_string(), cd.kind))
-                        .collect(),
-                    more: c.more,
-                });
-            }
-        }
-    }
-    None
 }
 
 fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
@@ -932,14 +688,6 @@ fn monitor(port: Option<String>, hex: bool, reset: bool) -> Result<()> {
     }
 }
 
-fn hexline(bytes: &[u8]) -> String {
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 // ---- firmware: flash / erase / reset (STM32 UART bootloader, via jolt) -----
 //
 // The console protocol above runs over the firmware's framed UART link; these
@@ -1003,4 +751,512 @@ fn reset_cmd(port: Option<String>, bootloader: bool) -> Result<()> {
         eprintln!("[tower] {port} reset into application");
     }
     Ok(())
+}
+
+// ===========================================================================
+// Tests
+//
+// The frame-session functions are generic over `Transport` (Read + Write), so we drive
+// them against an in-memory duplex mock instead of hardware: the "device" side is a queue
+// of bytes the code-under-test reads, and everything the code writes lands in a second
+// queue we can inspect. The mock returns `ErrorKind::TimedOut` when its read queue is
+// drained, exactly as a serial port does on its read timeout — so the read loops exercise
+// their real timeout paths.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Session functions live in `crate::session`; pull in the ones exercised here that aren't
+    // already re-exported into `main` (which imports only what the command layer calls).
+    use crate::session::{fota_data_payload, image_digest, validate_manifest, wait_for_hello};
+    use std::collections::VecDeque;
+    use std::io::{self, Read, Write};
+    use std::time::Duration;
+    // (CandidateKind, ShellCommand, MsgType, decode_frame, encode_frame, FrameDecoder come
+    // via `super::*` from the command layer's imports; only add what's test-only here.)
+    use tower_protocol::fota::{FOTA_MANIFEST_OFFSET, Manifest, SIGNED_LEN};
+    use tower_protocol::msg::{
+        Candidate, Dropped, Event, Hello, Level, Log, ShellCompletions, ShellResponse,
+    };
+    use tower_protocol::{MAX_WIRE, encode_frame_raw};
+
+    /// In-memory duplex transport. `to_read` feeds the code-under-test (as if from the
+    /// device); `written` captures everything the code writes (host→device).
+    struct MockPort {
+        to_read: VecDeque<u8>,
+        written: Vec<u8>,
+        /// Cap each `read` to this many bytes, to exercise chunk reassembly across reads
+        /// (a real UART delivers bytes in arbitrary-sized reads). 0 = no cap.
+        read_chunk: usize,
+        /// When true, a drained read returns `Ok(0)` (EOF) instead of `TimedOut` — used to
+        /// let the `fota_serve_loop` (which treats `Ok(0)` as EOF) terminate in a test.
+        eof_when_drained: bool,
+    }
+
+    impl MockPort {
+        fn new(to_read: Vec<u8>) -> Self {
+            MockPort {
+                to_read: to_read.into(),
+                written: Vec::new(),
+                read_chunk: 0,
+                eof_when_drained: false,
+            }
+        }
+        /// A mock that hands out at most `n` bytes per `read` call.
+        fn with_read_chunk(to_read: Vec<u8>, n: usize) -> Self {
+            let mut m = MockPort::new(to_read);
+            m.read_chunk = n;
+            m
+        }
+        /// A mock that returns EOF (`Ok(0)`) once drained.
+        fn with_eof(to_read: Vec<u8>) -> Self {
+            let mut m = MockPort::new(to_read);
+            m.eof_when_drained = true;
+            m
+        }
+    }
+
+    impl Read for MockPort {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.to_read.is_empty() {
+                return if self.eof_when_drained {
+                    Ok(0) // EOF
+                } else {
+                    // Drained: behave like a serial port past its read timeout.
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                };
+            }
+            let mut cap = buf.len().min(self.to_read.len());
+            if self.read_chunk != 0 {
+                cap = cap.min(self.read_chunk);
+            }
+            for slot in buf.iter_mut().take(cap) {
+                *slot = self.to_read.pop_front().unwrap();
+            }
+            Ok(cap)
+        }
+    }
+
+    impl Write for MockPort {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // ---- frame construction helpers ----
+
+    fn frame<T: serde::Serialize>(mt: MsgType, seq: u16, payload: &T) -> Vec<u8> {
+        let mut buf = [0u8; MAX_WIRE];
+        let n = encode_frame(mt, seq, payload, &mut buf).unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn shell_resp(cmd_id: u16, result: u8, chunk: u16, last: bool, text: &str) -> Vec<u8> {
+        frame(
+            MsgType::ShellResponse,
+            0,
+            &ShellResponse {
+                cmd_id,
+                result,
+                chunk,
+                last,
+                text,
+            },
+        )
+    }
+
+    fn hello(protocol_version: u8) -> Vec<u8> {
+        frame(
+            MsgType::Hello,
+            0,
+            &Hello {
+                protocol_version,
+                firmware_version: "test",
+            },
+        )
+    }
+
+    fn log_frame(seq: u16, msg: &str) -> Vec<u8> {
+        frame(
+            MsgType::Log,
+            seq,
+            &Log {
+                level: Level::Info,
+                uptime_us: 0,
+                module: "t",
+                message: msg,
+            },
+        )
+    }
+
+    const SHORT: Duration = Duration::from_millis(200);
+
+    // ---- read_response: reassembly, cmd_id filtering, chunk gaps ----
+
+    #[test]
+    fn read_response_reassembles_chunks() {
+        let mut bytes = shell_resp(7, 0, 0, false, "hello ");
+        bytes.extend(shell_resp(7, 0, 1, false, "wor"));
+        bytes.extend(shell_resp(7, 0, 2, true, "ld\n"));
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        let r = read_response(&mut sp, &mut dec, 7, SHORT).unwrap();
+        assert_eq!(r.text, "hello world\n");
+        assert_eq!(r.result, 0);
+        assert!(!r.incomplete);
+    }
+
+    #[test]
+    fn read_response_survives_byte_at_a_time_reads() {
+        // The same three chunks, but delivered one byte per read() — reassembly must not
+        // depend on frame boundaries aligning with read boundaries.
+        let mut bytes = shell_resp(1, 0, 0, false, "ab");
+        bytes.extend(shell_resp(1, 0, 1, true, "cd"));
+        let mut sp = MockPort::with_read_chunk(bytes, 1);
+        let mut dec = FrameDecoder::new();
+        let r = read_response(&mut sp, &mut dec, 1, SHORT).unwrap();
+        assert_eq!(r.text, "abcd");
+    }
+
+    #[test]
+    fn read_response_ignores_interleaved_logs() {
+        // A Log frame lands between response chunks; it must not corrupt reassembly.
+        let mut bytes = shell_resp(3, 0, 0, false, "x");
+        bytes.extend(log_frame(9, "noise"));
+        bytes.extend(shell_resp(3, 0, 1, true, "y"));
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        let r = read_response(&mut sp, &mut dec, 3, SHORT).unwrap();
+        assert_eq!(r.text, "xy");
+    }
+
+    #[test]
+    fn read_response_ignores_wrong_cmd_id() {
+        // A complete response for cmd_id 99 must not satisfy a wait for cmd_id 1 (C18).
+        let mut bytes = shell_resp(99, 0, 0, true, "stale");
+        bytes.extend(shell_resp(1, 0, 0, true, "mine"));
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        let r = read_response(&mut sp, &mut dec, 1, SHORT).unwrap();
+        assert_eq!(r.text, "mine");
+    }
+
+    #[test]
+    fn read_response_flags_dropped_chunk() {
+        // Chunk 1 is missing (as if CRC-dropped): 0 then 2 → incomplete (C19).
+        let mut bytes = shell_resp(5, 0, 0, false, "a");
+        bytes.extend(shell_resp(5, 0, 2, true, "c"));
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        let r = read_response(&mut sp, &mut dec, 5, SHORT).unwrap();
+        assert!(
+            r.incomplete,
+            "a chunk-index gap must mark the response incomplete"
+        );
+        assert_eq!(r.text, "ac"); // what did arrive is still returned
+    }
+
+    #[test]
+    fn read_response_times_out_when_silent() {
+        let mut sp = MockPort::new(Vec::new());
+        let mut dec = FrameDecoder::new();
+        assert!(read_response(&mut sp, &mut dec, 1, SHORT).is_none());
+    }
+
+    #[test]
+    fn read_response_drops_corrupt_crc_frame() {
+        // Flip a byte inside the COBS-encoded frame so the CRC fails; the decoder drops it
+        // and the waiter times out rather than returning garbage.
+        let mut bytes = shell_resp(1, 0, 0, true, "hello");
+        bytes[2] ^= 0xFF; // corrupt a payload byte (not the trailing 0x00 delimiter)
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        assert!(read_response(&mut sp, &mut dec, 1, SHORT).is_none());
+    }
+
+    // ---- Hello handshake ----
+
+    #[test]
+    fn wait_for_hello_returns_protocol_version() {
+        let mut sp = MockPort::new(hello(1));
+        let mut dec = FrameDecoder::new();
+        assert_eq!(wait_for_hello(&mut sp, &mut dec, SHORT), Some(1));
+    }
+
+    #[test]
+    fn wait_for_hello_reports_mismatched_version() {
+        let mut sp = MockPort::new(hello(99));
+        let mut dec = FrameDecoder::new();
+        // It surfaces the *device's* version; the caller compares against PROTOCOL_VERSION.
+        assert_eq!(wait_for_hello(&mut sp, &mut dec, SHORT), Some(99));
+        assert_ne!(99, tower_protocol::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn wait_for_hello_times_out_without_hello() {
+        let mut sp = MockPort::new(log_frame(0, "not a hello"));
+        let mut dec = FrameDecoder::new();
+        assert_eq!(wait_for_hello(&mut sp, &mut dec, SHORT), None);
+    }
+
+    // ---- render: seq-gap detection + Hello re-baseline ----
+
+    // (render()/RenderState + ColorMode behavior are unit-tested in `render.rs`, next to
+    // their now-private helpers. The golden-bytes decode below pins the shared wire contract.)
+
+    // ---- golden-bytes decode: pins the wire contract ----
+
+    #[test]
+    fn golden_frames_roundtrip_byte_at_a_time() {
+        // Synthesize one of each rendered type, concatenate, and feed byte-by-byte through a
+        // single decoder — asserting each decodes to the expected (type, seq) with a valid
+        // payload. This pins the encode/decode contract shared with the firmware.
+        let mut wire = Vec::new();
+        wire.extend(hello(tower_protocol::PROTOCOL_VERSION)); // seq 0
+        wire.extend(log_frame(1, "hi"));
+        wire.extend(frame(
+            MsgType::Event,
+            2,
+            &Event {
+                name: "boot",
+                fields: Default::default(),
+            },
+        ));
+        wire.extend(frame(MsgType::Dropped, 3, &Dropped { count: 4 }));
+        wire.extend(shell_resp(1, 0, 0, true, "ok"));
+
+        let expected = [
+            (MsgType::Hello, 0u16),
+            (MsgType::Log, 1),
+            (MsgType::Event, 2),
+            (MsgType::Dropped, 3),
+            (MsgType::ShellResponse, 0),
+        ];
+        let mut dec = FrameDecoder::new();
+        let mut seen = Vec::new();
+        for &b in &wire {
+            if let Some(inner) = dec.push(b) {
+                let (mt, seq, _payload) = decode_frame(inner).expect("valid frame");
+                seen.push((mt, seq));
+            }
+        }
+        assert_eq!(seen, expected);
+    }
+
+    // ---- request_completions ----
+
+    #[test]
+    fn request_completions_matches_req_id() {
+        let mut cands: heapless::Vec<Candidate, 16> = heapless::Vec::new();
+        cands
+            .push(Candidate {
+                text: "system",
+                kind: CandidateKind::Menu,
+            })
+            .unwrap();
+        let bytes = frame(
+            MsgType::ShellCompletions,
+            0,
+            &ShellCompletions {
+                req_id: 42,
+                token_start: 1,
+                common_prefix: "sys",
+                candidates: cands,
+                more: false,
+            },
+        );
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        let r = request_completions(&mut sp, &mut dec, "/s", 2, 42, SHORT).unwrap();
+        assert_eq!(r.token_start, 1);
+        assert_eq!(r.common_prefix, "sys");
+        assert_eq!(r.candidates.len(), 1);
+        // And a ShellComplete was actually written to the wire.
+        assert!(!sp.written.is_empty());
+    }
+
+    #[test]
+    fn request_completions_ignores_wrong_req_id() {
+        let cands: heapless::Vec<Candidate, 16> = heapless::Vec::new();
+        let bytes = frame(
+            MsgType::ShellCompletions,
+            0,
+            &ShellCompletions {
+                req_id: 1,
+                token_start: 0,
+                common_prefix: "",
+                candidates: cands,
+                more: false,
+            },
+        );
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        // We asked for req_id 2, device answered 1 → no match, times out.
+        assert!(request_completions(&mut sp, &mut dec, "", 0, 2, SHORT).is_none());
+    }
+
+    // ---- fota_data_payload: offset math (sentinel / mid-image / past-EOF) ----
+
+    #[test]
+    fn fota_payload_manifest_for_sentinel_offset() {
+        let image = vec![0xAAu8; 100];
+        let manifest = vec![0x55u8; SIGNED_LEN];
+        let p = fota_data_payload(FOTA_MANIFEST_OFFSET, 64, &image, &manifest);
+        assert_eq!(&p[..4], &FOTA_MANIFEST_OFFSET.to_le_bytes());
+        assert_eq!(&p[4..], &manifest[..]);
+    }
+
+    #[test]
+    fn fota_payload_mid_image_slice() {
+        let image: Vec<u8> = (0..100).collect();
+        let manifest = vec![0u8; SIGNED_LEN];
+        let p = fota_data_payload(10, 8, &image, &manifest);
+        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 10);
+        assert_eq!(&p[4..], &image[10..18]);
+    }
+
+    #[test]
+    fn fota_payload_clamps_partial_tail() {
+        let image: Vec<u8> = (0..10).collect();
+        let manifest = vec![0u8; SIGNED_LEN];
+        // Ask for 8 bytes at offset 6 — only 4 exist; the tail is clamped.
+        let p = fota_data_payload(6, 8, &image, &manifest);
+        assert_eq!(&p[4..], &image[6..10]);
+    }
+
+    #[test]
+    fn fota_payload_past_eof_is_offset_only() {
+        let image = vec![0u8; 10];
+        let manifest = vec![0u8; SIGNED_LEN];
+        let p = fota_data_payload(1000, 8, &image, &manifest);
+        assert_eq!(p.len(), 4); // just the echoed offset, no bytes
+        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 1000);
+    }
+
+    /// Encode a raw `FotaReq{offset,len}` wire frame.
+    fn fota_req(offset: u32, len: u16) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&offset.to_le_bytes());
+        p.extend_from_slice(&len.to_le_bytes());
+        let mut wire = [0u8; MAX_WIRE];
+        let n = encode_frame_raw(MsgType::FotaReq, 0, &p, &mut wire).unwrap();
+        wire[..n].to_vec()
+    }
+
+    /// Decode the FotaData frames the serve loop wrote back, returning each `(offset, bytes)`.
+    fn decode_fota_data(written: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let mut dec = FrameDecoder::new();
+        let mut out = Vec::new();
+        for &b in written {
+            if let Some(inner) = dec.push(b)
+                && let Ok((MsgType::FotaData, _seq, p)) = decode_frame(inner)
+            {
+                let off = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                out.push((off, p[4..].to_vec()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fota_serve_loop_answers_request_then_ends_on_eof() {
+        // A FotaReq for the manifest and one for a mid-image slice; the loop answers both and
+        // returns Ok once the (EOF) mock drains.
+        let image: Vec<u8> = (0..64).collect();
+        let manifest = vec![0x11u8; SIGNED_LEN];
+        let mut wire = fota_req(FOTA_MANIFEST_OFFSET, SIGNED_LEN as u16);
+        wire.extend(fota_req(8, 16));
+        let mut sp = MockPort::with_eof(wire);
+        fota_serve_loop(&mut sp, &image, &manifest).unwrap();
+
+        let answers = decode_fota_data(&sp.written);
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].0, FOTA_MANIFEST_OFFSET);
+        assert_eq!(answers[0].1, manifest);
+        assert_eq!(answers[1].0, 8);
+        assert_eq!(answers[1].1, &image[8..24]);
+    }
+
+    #[test]
+    fn fota_serve_loop_clamps_past_eof_request() {
+        // A request beyond the image end is answered with the echoed offset and zero bytes.
+        let image = vec![0xABu8; 10];
+        let manifest = vec![0u8; SIGNED_LEN];
+        let mut sp = MockPort::with_eof(fota_req(1000, 32));
+        fota_serve_loop(&mut sp, &image, &manifest).unwrap();
+        let answers = decode_fota_data(&sp.written);
+        assert_eq!(answers, vec![(1000u32, Vec::new())]);
+    }
+
+    #[test]
+    fn fota_serve_loop_ignores_truncated_request() {
+        // A FotaReq with a <6-byte payload must be dropped by the guard → no FotaData written.
+        let image = vec![0u8; 4];
+        let manifest = vec![0u8; SIGNED_LEN];
+        let short = [1u8, 2, 3]; // only 3 bytes
+        let mut wire = [0u8; MAX_WIRE];
+        let n = encode_frame_raw(MsgType::FotaReq, 0, &short, &mut wire).unwrap();
+        let mut sp = MockPort::with_eof(wire[..n].to_vec());
+        fota_serve_loop(&mut sp, &image, &manifest).unwrap();
+        assert!(sp.written.is_empty());
+    }
+
+    // ---- validate_manifest / image_digest ----
+
+    fn signed_manifest_for(image: &[u8], override_size: Option<u32>) -> Vec<u8> {
+        let m = Manifest {
+            flags: 0,
+            hw_id: 0,
+            version: 1,
+            size: override_size.unwrap_or(image.len() as u32),
+            sha256: image_digest(image),
+        };
+        let sig = [0u8; tower_protocol::fota::SIG_LEN];
+        m.encode_signed(&sig).to_vec()
+    }
+
+    #[test]
+    fn validate_manifest_accepts_matching_pair() {
+        let image = vec![1u8, 2, 3, 4, 5];
+        let manifest = signed_manifest_for(&image, None);
+        assert!(validate_manifest(&image, &manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_wrong_length() {
+        let image = vec![0u8; 8];
+        let mut manifest = signed_manifest_for(&image, None);
+        manifest.pop(); // wrong byte length
+        assert!(validate_manifest(&image, &manifest).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_size_mismatch() {
+        let image = vec![0u8; 8];
+        // size field claims 9 but the image is 8.
+        let manifest = signed_manifest_for(&image, Some(9));
+        assert!(validate_manifest(&image, &manifest).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_rejects_hash_mismatch() {
+        let image = vec![0u8; 8];
+        let other = vec![0xFFu8; 8]; // same length, different content → different digest
+        let manifest = signed_manifest_for(&other, Some(8));
+        assert!(validate_manifest(&image, &manifest).is_err());
+    }
+
+    #[test]
+    fn image_digest_matches_fota_sign_scheme() {
+        // SHA-512 truncated to 256 bits (see fota-sign::image_digest). Pin a known value so a
+        // future refactor can't silently switch hash schemes and break FOTA validation.
+        use sha2::{Digest, Sha512};
+        let image = b"hardwario tower";
+        let full: [u8; 64] = Sha512::digest(image).into();
+        assert_eq!(image_digest(image), full[..32]);
+    }
 }

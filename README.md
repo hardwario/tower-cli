@@ -39,8 +39,37 @@ On Windows, extract the `.zip` and put `tower.exe` on your `PATH`.
 ```sh
 tower --help          # all commands
 tower --version       # print the tower-cli version
-tower                 # open the TUI console on the detected port
+tower                 # open the TUI console on the detected port (bare, no subcommand)
 ```
+
+The streaming commands render the framed link to stdout:
+
+```sh
+tower logs                        # decoded logs + print! output
+tower logs --color never          # force plain output (--color auto|always|never)
+tower events                      # structured key=value events
+tower exec "/system/resource"     # run one shell command, print its reply, exit
+tower exec "/slow/op" --timeout 5000   # widen the per-command idle timeout (ms)
+tower logs --no-reconnect         # exit when the link drops instead of retrying
+```
+
+Colors default to **auto**: on when stdout is a terminal and `NO_COLOR` is unset,
+off when piped or redirected. The first port open is always fatal (a bad `--port`
+exits non-zero rather than retrying); reconnection only kicks in after a successful
+attach, and `--no-reconnect` disables it entirely.
+
+### Exit codes
+
+`tower` follows a small, stable exit-code contract so scripts and CI can branch on
+the cause of a failure:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | success |
+| `1`  | tool error (I/O, bad file, encode/decode, protocol-version mismatch) |
+| `2`  | usage error (bad arguments — emitted by clap) |
+| `124`| device command timed out (no or incomplete response) |
+| `1..=123` | `exec` only: the device-reported shell result (clamped into this range) |
 
 ## Flashing firmware
 

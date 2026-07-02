@@ -1,6 +1,6 @@
 [package]
 name = "tower-cli"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2024"
 description = "HARDWARIO TOWER console host CLI (`tower`): renders the framed serial link from the tower firmware."
 license = "MIT"

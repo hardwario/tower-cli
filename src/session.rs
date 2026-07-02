@@ -1,23 +1,18 @@
 //! The framed console **session** over a byte transport: the boot-`Hello` handshake, the
-//! `ShellResponse` reassembler, the `ShellCompletions` request/response, and the FOTA
-//! host-proxy serve loop. Everything here is generic over [`Transport`] (`Read + Write`), so
+//! `ShellResponse` reassembler, and the `ShellCompletions` request/response. Everything here
+//! is generic over [`Transport`] (`Read + Write`), so
 //! it runs unchanged over a real `Box<dyn serialport::SerialPort>` in production and over an
 //! in-memory mock in tests — which is what makes the session logic testable without hardware.
 //!
 //! What is deliberately *not* here: opening/enumerating ports and the reset pulse (that's
 //! `port`), rendering the stream (that's `render`), and the rustyline/clap glue for the
-//! interactive shell and FOTA command wiring (that stays in the command layer in `main`).
+//! interactive shell (that stays in the command layer in `main`).
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-
-use tower_protocol::fota::{FOTA_MANIFEST_OFFSET, Manifest, SHA256_LEN, SIGNED_LEN};
 use tower_protocol::msg::{CandidateKind, Hello, ShellComplete, ShellCompletions, ShellResponse};
-use tower_protocol::{
-    FrameDecoder, MAX_WIRE, MsgType, decode_frame, encode_frame, encode_frame_raw,
-};
+use tower_protocol::{FrameDecoder, MAX_WIRE, MsgType, decode_frame, encode_frame};
 
 /// The byte transport the session runs over: just `Read + Write`. A real
 /// `Box<dyn serialport::SerialPort>` already satisfies this (so production callers are
@@ -219,119 +214,4 @@ pub(crate) fn request_completions(
         }
     }
     None
-}
-
-// ---- FOTA host-proxy serve ------------------------------------------------
-
-/// The FOTA image digest carried in `Manifest::sha256`: **SHA-512 truncated to 256 bits**.
-/// This MUST match `firmware/tools/fota-sign::image_digest` (and the device bootloader),
-/// which reuse salty's SHA-512 rather than carrying a second hash engine — so we validate
-/// against the same value the signer committed to.
-pub(crate) fn image_digest(image: &[u8]) -> [u8; SHA256_LEN] {
-    use sha2::{Digest, Sha512};
-    let full: [u8; 64] = Sha512::digest(image).into();
-    let mut out = [0u8; SHA256_LEN];
-    out.copy_from_slice(&full[..SHA256_LEN]);
-    out
-}
-
-/// Validate that the signed manifest actually describes the image we're about to serve, so a
-/// stale/mismatched `--manifest` fails here at startup rather than as a silent verify failure
-/// on the node hours into an OTA. Checks the byte length, that the manifest header parses, that
-/// `size` equals the image length, and that `sha256` equals our recomputed digest. We do NOT
-/// re-verify the Ed25519 signature (that's the node bootloader's job, against the vendor key);
-/// we only confirm the image/manifest pairing is self-consistent.
-pub(crate) fn validate_manifest(image: &[u8], manifest: &[u8]) -> Result<()> {
-    if manifest.len() != SIGNED_LEN {
-        bail!(
-            "manifest must be {SIGNED_LEN} bytes (a `fota-sign` .fmanifest), got {}",
-            manifest.len()
-        );
-    }
-    let m = Manifest::decode(manifest)
-        .context("manifest header invalid (bad magic/format — not a `fota-sign` .fmanifest?)")?;
-    if m.size as usize != image.len() {
-        bail!(
-            "manifest/image mismatch: manifest size {} B but image is {} B (wrong --manifest for this --image?)",
-            m.size,
-            image.len()
-        );
-    }
-    let digest = image_digest(image);
-    if m.sha256 != digest {
-        bail!(
-            "manifest/image mismatch: sha256 differs from the image digest (stale manifest for this image?)"
-        );
-    }
-    Ok(())
-}
-
-/// Build the `FotaData` payload answering a `FotaReq{offset,len}`: the echoed `offset`
-/// followed by the requested bytes — the whole signed manifest for the sentinel offset,
-/// otherwise the image slice `[offset, offset+len)` **clamped to the image bounds** (a
-/// request past EOF yields just the echoed offset with no bytes; a partial tail is
-/// truncated to what exists). Pure, so it can be unit-tested against the offset math.
-pub(crate) fn fota_data_payload(offset: u32, len: usize, image: &[u8], manifest: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(4 + len);
-    payload.extend_from_slice(&offset.to_le_bytes());
-    if offset == FOTA_MANIFEST_OFFSET {
-        payload.extend_from_slice(manifest);
-    } else {
-        let start = (offset as usize).min(image.len());
-        let end = start.saturating_add(len).min(image.len());
-        payload.extend_from_slice(&image[start..end]);
-    }
-    payload
-}
-
-/// Answer `FotaReq` frames with `FotaData` until the transport errors or reaches EOF.
-pub(crate) fn fota_serve_loop(
-    sp: &mut (impl Transport + ?Sized),
-    image: &[u8],
-    manifest: &[u8],
-) -> Result<()> {
-    let mut dec = FrameDecoder::new();
-    let mut rbuf = [0u8; 512];
-    let mut seq: u16 = 0;
-    let mut served_to = 0usize; // high-water of image bytes served, for the progress line
-    loop {
-        let n = match sp.read(&mut rbuf) {
-            // A real serial port returns `TimedOut` when idle, never `Ok(0)` on a live port;
-            // `Ok(0)` therefore means EOF (a drained test transport), so end the loop cleanly.
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-            Err(e) => return Err(e.into()),
-        };
-        for &b in &rbuf[..n] {
-            let Some(inner) = dec.push(b) else { continue };
-            let Ok((MsgType::FotaReq, _seq, p)) = decode_frame(inner) else {
-                continue;
-            };
-            if p.len() < 6 {
-                continue;
-            }
-            let offset = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-            let len = u16::from_le_bytes([p[4], p[5]]) as usize;
-
-            let payload = fota_data_payload(offset, len, image, manifest);
-            if offset == FOTA_MANIFEST_OFFSET {
-                eprintln!("[tower] -> manifest ({} B)", manifest.len());
-            } else {
-                served_to = served_to.max((offset as usize).saturating_add(len).min(image.len()));
-                eprint!("\r[tower] serving {served_to}/{} B", image.len());
-                let _ = std::io::stderr().flush();
-            }
-
-            let mut frame = [0u8; MAX_WIRE];
-            match encode_frame_raw(MsgType::FotaData, seq, &payload, &mut frame) {
-                Ok(fn_len) => {
-                    sp.write_all(&frame[..fn_len])?;
-                    sp.flush()?;
-                    seq = seq.wrapping_add(1);
-                }
-                Err(e) => eprintln!("\n[tower] encode FotaData failed: {e:?}"),
-            }
-        }
-    }
 }

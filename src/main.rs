@@ -1,5 +1,5 @@
 //! `tower` — HARDWARIO TOWER host CLI: devices, logs/events, shell/exec, the console TUI,
-//! flash/erase/reset (via the jolt engine), and `fota serve`.
+//! and flash/erase/reset (via the jolt engine).
 //!
 //! The firmware's UART is always framed (`tower-protocol`: COBS + CRC + postcard),
 //! so a plain terminal shows binary — this tool decodes it. The same `FrameDecoder`
@@ -32,9 +32,7 @@ use port::{devices, open_console, pick_port};
 use render::{
     ColorMode, OutputMode, View, hexline, read_loop, resolve_color, warn_protocol_mismatch,
 };
-use session::{
-    await_ready, fota_serve_loop, read_response, request_completions, validate_manifest,
-};
+use session::{await_ready, read_response, request_completions};
 
 // ---- exit-code contract ---------------------------------------------------
 //
@@ -66,7 +64,7 @@ struct Cli {
     // The field stays `port` since it holds a serial-port path; the user-facing flag is `--device`.
     #[arg(short = 'd', long = "device", value_name = "DEVICE", global = true)]
     port: Option<String>,
-    /// Don't auto-reconnect on the streaming commands (`logs`/`events`/`fota serve`):
+    /// Don't auto-reconnect on the streaming commands (`logs`/`events`):
     /// exit when the link drops instead of retrying. (The first open is always fatal.)
     #[arg(long, global = true)]
     no_reconnect: bool,
@@ -193,29 +191,6 @@ enum Cmd {
         #[arg(long)]
         bootloader: bool,
     },
-    /// Firmware-over-the-air (FOTA) host-side helpers.
-    Fota {
-        #[command(subcommand)]
-        cmd: FotaCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum FotaCmd {
-    /// Host-proxy image source: serve a signed firmware image to a FOTA gateway on demand.
-    ///
-    /// The gateway (which holds no image of its own) sends `FotaReq{offset,len}` frames over
-    /// the console link; this answers each with the requested image bytes (or the signed
-    /// manifest for the sentinel offset). The node pulls it over the radio, and the
-    /// bootloader verifies the Ed25519 signature + SHA-256 before swapping. See docs/fota.md.
-    Serve {
-        /// The raw firmware image (e.g. `target/fota-ota-v2.bin`).
-        #[arg(long)]
-        image: PathBuf,
-        /// The signed manifest for that image (`fota-sign sign ...`, 116 bytes).
-        #[arg(long)]
-        manifest: PathBuf,
-    },
 }
 
 fn main() -> ExitCode {
@@ -301,11 +276,6 @@ fn run(cli: Cli) -> Result<u8> {
         }
         Cmd::Erase { verbose } => erase_cmd(cli.port, verbose).map(|()| EXIT_OK),
         Cmd::Reset { bootloader } => reset_cmd(cli.port, bootloader).map(|()| EXIT_OK),
-        Cmd::Fota { cmd } => match cmd {
-            FotaCmd::Serve { image, manifest } => {
-                fota_serve(cli.port, image, manifest, reconnect).map(|()| EXIT_OK)
-            }
-        },
     }
 }
 
@@ -317,56 +287,6 @@ fn output_mode(color: ColorMode, no_colors: bool, json: bool) -> OutputMode {
     } else {
         OutputMode::Text {
             colors: resolve_color(color, no_colors),
-        }
-    }
-}
-
-// ---- FOTA host-proxy serve ------------------------------------------------
-
-/// Serve a signed firmware image to a FOTA gateway over the framed console link: read the
-/// image + manifest once, then answer each `FotaReq{offset,len}` frame with a `FotaData`
-/// frame (the manifest for the sentinel offset, image bytes otherwise). The gateway relays
-/// the bytes to the node over the radio; the node's bootloader verifies signature + hash
-/// before swapping. Reconnects if the gateway resets (unless `reconnect` is false). Runs
-/// until interrupted.
-fn fota_serve(
-    port: Option<String>,
-    image_path: PathBuf,
-    manifest_path: PathBuf,
-    reconnect: bool,
-) -> Result<()> {
-    let image = std::fs::read(&image_path)
-        .with_context(|| format!("reading image {}", image_path.display()))?;
-    let manifest = std::fs::read(&manifest_path)
-        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
-    validate_manifest(&image, &manifest)?;
-    let port = pick_port(port)?;
-    eprintln!(
-        "[tower] fota serve: image {} B + manifest {} B (validated); answering FotaReq on {port}",
-        image.len(),
-        manifest.len()
-    );
-    // The FIRST open is fatal: a bad --device or a busy device should exit 1, not spin forever.
-    // Enter the reconnect loop only after one success (and only if reconnection is enabled).
-    let mut sp = open_console(&port, false)?;
-    loop {
-        eprintln!("[tower] connected {port}");
-        if let Err(e) = fota_serve_loop(&mut *sp, &image, &manifest) {
-            eprintln!("[tower] {port} lost: {e}");
-        }
-        if !reconnect {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(800));
-        eprintln!("[tower] reconnecting…");
-        // Re-establish the run baseline on every reopen (like every other command) so the
-        // bridge can't leave the gateway held in reset. Tolerate a failed reopen and retry.
-        match open_console(&port, false) {
-            Ok(reopened) => sp = reopened,
-            Err(e) => {
-                eprintln!("[tower] {e}");
-                continue;
-            }
         }
     }
 }
@@ -784,17 +704,16 @@ mod tests {
     use super::*;
     // Session functions live in `crate::session`; pull in the ones exercised here that aren't
     // already re-exported into `main` (which imports only what the command layer calls).
-    use crate::session::{fota_data_payload, image_digest, validate_manifest, wait_for_hello};
+    use crate::session::wait_for_hello;
     use std::collections::VecDeque;
     use std::io::{self, Read, Write};
     use std::time::Duration;
     // (CandidateKind, ShellCommand, MsgType, decode_frame, encode_frame, FrameDecoder come
     // via `super::*` from the command layer's imports; only add what's test-only here.)
-    use tower_protocol::fota::{FOTA_MANIFEST_OFFSET, Manifest, SIGNED_LEN};
+    use tower_protocol::MAX_WIRE;
     use tower_protocol::msg::{
         Candidate, Dropped, Event, Hello, Level, Log, ShellCompletions, ShellResponse,
     };
-    use tower_protocol::{MAX_WIRE, encode_frame_raw};
 
     /// In-memory duplex transport. `to_read` feeds the code-under-test (as if from the
     /// device); `written` captures everything the code writes (host→device).
@@ -804,9 +723,6 @@ mod tests {
         /// Cap each `read` to this many bytes, to exercise chunk reassembly across reads
         /// (a real UART delivers bytes in arbitrary-sized reads). 0 = no cap.
         read_chunk: usize,
-        /// When true, a drained read returns `Ok(0)` (EOF) instead of `TimedOut` — used to
-        /// let the `fota_serve_loop` (which treats `Ok(0)` as EOF) terminate in a test.
-        eof_when_drained: bool,
     }
 
     impl MockPort {
@@ -815,7 +731,6 @@ mod tests {
                 to_read: to_read.into(),
                 written: Vec::new(),
                 read_chunk: 0,
-                eof_when_drained: false,
             }
         }
         /// A mock that hands out at most `n` bytes per `read` call.
@@ -824,23 +739,13 @@ mod tests {
             m.read_chunk = n;
             m
         }
-        /// A mock that returns EOF (`Ok(0)`) once drained.
-        fn with_eof(to_read: Vec<u8>) -> Self {
-            let mut m = MockPort::new(to_read);
-            m.eof_when_drained = true;
-            m
-        }
     }
 
     impl Read for MockPort {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             if self.to_read.is_empty() {
-                return if self.eof_when_drained {
-                    Ok(0) // EOF
-                } else {
-                    // Drained: behave like a serial port past its read timeout.
-                    Err(io::Error::from(io::ErrorKind::TimedOut))
-                };
+                // Drained: behave like a serial port past its read timeout.
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
             let mut cap = buf.len().min(self.to_read.len());
             if self.read_chunk != 0 {
@@ -1113,166 +1018,5 @@ mod tests {
         let mut dec = FrameDecoder::new();
         // We asked for req_id 2, device answered 1 → no match, times out.
         assert!(request_completions(&mut sp, &mut dec, "", 0, 2, SHORT).is_none());
-    }
-
-    // ---- fota_data_payload: offset math (sentinel / mid-image / past-EOF) ----
-
-    #[test]
-    fn fota_payload_manifest_for_sentinel_offset() {
-        let image = vec![0xAAu8; 100];
-        let manifest = vec![0x55u8; SIGNED_LEN];
-        let p = fota_data_payload(FOTA_MANIFEST_OFFSET, 64, &image, &manifest);
-        assert_eq!(&p[..4], &FOTA_MANIFEST_OFFSET.to_le_bytes());
-        assert_eq!(&p[4..], &manifest[..]);
-    }
-
-    #[test]
-    fn fota_payload_mid_image_slice() {
-        let image: Vec<u8> = (0..100).collect();
-        let manifest = vec![0u8; SIGNED_LEN];
-        let p = fota_data_payload(10, 8, &image, &manifest);
-        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 10);
-        assert_eq!(&p[4..], &image[10..18]);
-    }
-
-    #[test]
-    fn fota_payload_clamps_partial_tail() {
-        let image: Vec<u8> = (0..10).collect();
-        let manifest = vec![0u8; SIGNED_LEN];
-        // Ask for 8 bytes at offset 6 — only 4 exist; the tail is clamped.
-        let p = fota_data_payload(6, 8, &image, &manifest);
-        assert_eq!(&p[4..], &image[6..10]);
-    }
-
-    #[test]
-    fn fota_payload_past_eof_is_offset_only() {
-        let image = vec![0u8; 10];
-        let manifest = vec![0u8; SIGNED_LEN];
-        let p = fota_data_payload(1000, 8, &image, &manifest);
-        assert_eq!(p.len(), 4); // just the echoed offset, no bytes
-        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 1000);
-    }
-
-    /// Encode a raw `FotaReq{offset,len}` wire frame.
-    fn fota_req(offset: u32, len: u16) -> Vec<u8> {
-        let mut p = Vec::new();
-        p.extend_from_slice(&offset.to_le_bytes());
-        p.extend_from_slice(&len.to_le_bytes());
-        let mut wire = [0u8; MAX_WIRE];
-        let n = encode_frame_raw(MsgType::FotaReq, 0, &p, &mut wire).unwrap();
-        wire[..n].to_vec()
-    }
-
-    /// Decode the FotaData frames the serve loop wrote back, returning each `(offset, bytes)`.
-    fn decode_fota_data(written: &[u8]) -> Vec<(u32, Vec<u8>)> {
-        let mut dec = FrameDecoder::new();
-        let mut out = Vec::new();
-        for &b in written {
-            if let Some(inner) = dec.push(b)
-                && let Ok((MsgType::FotaData, _seq, p)) = decode_frame(inner)
-            {
-                let off = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-                out.push((off, p[4..].to_vec()));
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn fota_serve_loop_answers_request_then_ends_on_eof() {
-        // A FotaReq for the manifest and one for a mid-image slice; the loop answers both and
-        // returns Ok once the (EOF) mock drains.
-        let image: Vec<u8> = (0..64).collect();
-        let manifest = vec![0x11u8; SIGNED_LEN];
-        let mut wire = fota_req(FOTA_MANIFEST_OFFSET, SIGNED_LEN as u16);
-        wire.extend(fota_req(8, 16));
-        let mut sp = MockPort::with_eof(wire);
-        fota_serve_loop(&mut sp, &image, &manifest).unwrap();
-
-        let answers = decode_fota_data(&sp.written);
-        assert_eq!(answers.len(), 2);
-        assert_eq!(answers[0].0, FOTA_MANIFEST_OFFSET);
-        assert_eq!(answers[0].1, manifest);
-        assert_eq!(answers[1].0, 8);
-        assert_eq!(answers[1].1, &image[8..24]);
-    }
-
-    #[test]
-    fn fota_serve_loop_clamps_past_eof_request() {
-        // A request beyond the image end is answered with the echoed offset and zero bytes.
-        let image = vec![0xABu8; 10];
-        let manifest = vec![0u8; SIGNED_LEN];
-        let mut sp = MockPort::with_eof(fota_req(1000, 32));
-        fota_serve_loop(&mut sp, &image, &manifest).unwrap();
-        let answers = decode_fota_data(&sp.written);
-        assert_eq!(answers, vec![(1000u32, Vec::new())]);
-    }
-
-    #[test]
-    fn fota_serve_loop_ignores_truncated_request() {
-        // A FotaReq with a <6-byte payload must be dropped by the guard → no FotaData written.
-        let image = vec![0u8; 4];
-        let manifest = vec![0u8; SIGNED_LEN];
-        let short = [1u8, 2, 3]; // only 3 bytes
-        let mut wire = [0u8; MAX_WIRE];
-        let n = encode_frame_raw(MsgType::FotaReq, 0, &short, &mut wire).unwrap();
-        let mut sp = MockPort::with_eof(wire[..n].to_vec());
-        fota_serve_loop(&mut sp, &image, &manifest).unwrap();
-        assert!(sp.written.is_empty());
-    }
-
-    // ---- validate_manifest / image_digest ----
-
-    fn signed_manifest_for(image: &[u8], override_size: Option<u32>) -> Vec<u8> {
-        let m = Manifest {
-            flags: 0,
-            hw_id: 0,
-            version: 1,
-            size: override_size.unwrap_or(image.len() as u32),
-            sha256: image_digest(image),
-        };
-        let sig = [0u8; tower_protocol::fota::SIG_LEN];
-        m.encode_signed(&sig).to_vec()
-    }
-
-    #[test]
-    fn validate_manifest_accepts_matching_pair() {
-        let image = vec![1u8, 2, 3, 4, 5];
-        let manifest = signed_manifest_for(&image, None);
-        assert!(validate_manifest(&image, &manifest).is_ok());
-    }
-
-    #[test]
-    fn validate_manifest_rejects_wrong_length() {
-        let image = vec![0u8; 8];
-        let mut manifest = signed_manifest_for(&image, None);
-        manifest.pop(); // wrong byte length
-        assert!(validate_manifest(&image, &manifest).is_err());
-    }
-
-    #[test]
-    fn validate_manifest_rejects_size_mismatch() {
-        let image = vec![0u8; 8];
-        // size field claims 9 but the image is 8.
-        let manifest = signed_manifest_for(&image, Some(9));
-        assert!(validate_manifest(&image, &manifest).is_err());
-    }
-
-    #[test]
-    fn validate_manifest_rejects_hash_mismatch() {
-        let image = vec![0u8; 8];
-        let other = vec![0xFFu8; 8]; // same length, different content → different digest
-        let manifest = signed_manifest_for(&other, Some(8));
-        assert!(validate_manifest(&image, &manifest).is_err());
-    }
-
-    #[test]
-    fn image_digest_matches_fota_sign_scheme() {
-        // SHA-512 truncated to 256 bits (see fota-sign::image_digest). Pin a known value so a
-        // future refactor can't silently switch hash schemes and break FOTA validation.
-        use sha2::{Digest, Sha512};
-        let image = b"hardwario tower";
-        let full: [u8; 64] = Sha512::digest(image).into();
-        assert_eq!(image_digest(image), full[..32]);
     }
 }

@@ -23,7 +23,6 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("shell"))
         .stdout(predicate::str::contains("exec"))
         .stdout(predicate::str::contains("console"))
-        .stdout(predicate::str::contains("fota"))
         // The bare-`tower` UX: the command is optional (no subcommand → TUI).
         .stdout(predicate::str::contains("[COMMAND]"));
 }
@@ -93,4 +92,3 @@ fn nonexistent_device_first_open_is_fatal() {
         .code(1)
         .stderr(predicate::str::contains("error"));
 }
-

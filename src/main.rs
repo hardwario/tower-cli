@@ -720,23 +720,38 @@ fn flash_cmd(
         fw.len()
     );
     let mut sp = jolt::port::Port::open(&port).with_context(|| format!("opening {port}"))?;
-    let opts = jolt::flash::FlashOptions {
-        erase,
-        verify,
-        run,
-        go,
-        verbose,
-    };
-    jolt::flash::flash(&mut sp, &fw, &opts).context("flashing firmware")
+    // jolt's FlashOptions is #[non_exhaustive] (a new option won't break us): start from Default
+    // and override. `verbose` moved out of the options into the progress sink below.
+    let mut opts = jolt::flash::FlashOptions::default();
+    opts.erase = erase;
+    opts.verify = verify;
+    opts.run = run;
+    opts.go = go;
+    let mut report = flash_progress(verbose);
+    jolt::flash::flash(&mut sp, &fw, &opts, &mut report).context("flashing firmware")
 }
 
 fn erase_cmd(port: Option<String>, verbose: bool) -> Result<()> {
     let port = pick_port(port)?;
     eprintln!("[tower] erasing {port}");
     let mut sp = jolt::port::Port::open(&port).with_context(|| format!("opening {port}"))?;
-    let pages = jolt::flash::erase(&mut sp, verbose).context("erasing flash")?;
+    let mut report = flash_progress(verbose);
+    let pages = jolt::flash::erase(&mut sp, &mut report).context("erasing flash")?;
     eprintln!("[tower] erased {pages} page(s), reset into application");
     Ok(())
+}
+
+/// A jolt flash/erase progress sink. jolt's library no longer prints (it emits `Progress`
+/// events); we render them to stderr — every event under `--verbose`, else just the chip-id
+/// milestone so a normal flash still shows the target was identified.
+fn flash_progress(verbose: bool) -> impl FnMut(jolt::flash::Progress) {
+    move |p| {
+        if verbose {
+            eprintln!("[tower] {p:?}");
+        } else if let jolt::flash::Progress::ChipIdentified { id } = p {
+            eprintln!("[tower] chip 0x{id:03x}");
+        }
+    }
 }
 
 fn reset_cmd(port: Option<String>, bootloader: bool) -> Result<()> {

@@ -29,12 +29,12 @@ sha2 = "0.10"
 # pinned to a tag so a standalone clone builds reproducibly. Bump in lockstep with any wire
 # change. For side-by-side development against a local checkout, see `.cargo/config.toml`
 # (gitignored `paths` override) — it doesn't touch Cargo.lock or affect other clones.
-tower-protocol = { git = "https://github.com/hardwario/tower-protocol", tag = "v1.0.0" }
+tower-protocol = { git = "https://github.com/hardwario/tower-protocol", tag = "v1.1.0" }
 # STM32L0 UART-bootloader engine (flash / erase / reset), shared with the standalone
 # `jolt` CLI. Pinned to a tag so a standalone clone builds reproducibly, like
 # tower-protocol above. For side-by-side dev against a local checkout, see the
 # `.cargo/config.toml` `paths` override.
-jolt = { git = "https://github.com/hardwario/jolt", tag = "v1.2.0" }
+jolt = { git = "https://github.com/hardwario/jolt", tag = "v1.3.0", default-features = false }
 
 [dev-dependencies]
 # Tests build wire frames with the protocol's own message types; `ShellCompletions`/`Event`

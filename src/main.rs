@@ -902,7 +902,9 @@ mod tests {
             0,
             &Hello {
                 protocol_version,
+                firmware_name: "app",
                 firmware_version: "test",
+                session_id: 1,
             },
         )
     }
@@ -947,7 +949,9 @@ mod tests {
         let pn = postcard::to_slice(
             &Hello {
                 protocol_version: ver,
+                firmware_name: "app",
                 firmware_version: "mismatch",
+                session_id: 1,
             },
             &mut pbuf,
         )
@@ -1077,12 +1081,13 @@ mod tests {
         // rejects it before the Hello payload parses. Forge that on the wire — the host's own
         // encoder always stamps the current version, so the old `hello(99)` test (payload-only
         // mismatch, header still valid) decoded fine and never modelled a real mismatch.
-        assert_ne!(2, tower_protocol::PROTOCOL_VERSION);
-        let mut sp = MockPort::new(hello_wire_bad_version(2));
+        // A device still speaking the previous protocol (v1) is the realistic mismatch.
+        assert_ne!(1, tower_protocol::PROTOCOL_VERSION);
+        let mut sp = MockPort::new(hello_wire_bad_version(1));
         let mut dec = FrameDecoder::new();
         assert_eq!(
             wait_for_hello(&mut sp, &mut dec, SHORT),
-            Readiness::BadVersion(2)
+            Readiness::BadVersion(1)
         );
     }
 
@@ -1090,11 +1095,11 @@ mod tests {
     fn await_ready_reports_bad_version() {
         // The readiness path (used by `exec`) propagates the mismatch so `exec` can bail fast
         // with a distinct exit code instead of a generic timeout.
-        let mut sp = MockPort::new(hello_wire_bad_version(2));
+        let mut sp = MockPort::new(hello_wire_bad_version(1));
         let mut dec = FrameDecoder::new();
         assert_eq!(
             await_ready(&mut sp, &mut dec, None),
-            Readiness::BadVersion(2)
+            Readiness::BadVersion(1)
         );
     }
 

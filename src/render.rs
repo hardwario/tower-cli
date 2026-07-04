@@ -13,8 +13,8 @@ use std::io::Write;
 use anyhow::Result;
 use clap::ValueEnum;
 
-use tower_protocol::msg::{Dropped, Event, Hello, Level, Log, Print};
-use tower_protocol::{FrameDecoder, MsgType, decode_frame};
+use tower_protocol::msg::{Dropped, Event, Level, Log, Print};
+use tower_protocol::{FrameDecoder, Msg, decode_msg};
 
 use crate::session::Transport;
 
@@ -162,6 +162,9 @@ pub(crate) struct RenderState {
     pub(crate) decode_failures: u64,
     /// Whether we've already shouted about a protocol-version mismatch (warn once per stream).
     warned_mismatch: bool,
+    /// The `session_id` from the last `Hello`. The console re-emits `Hello` on every USB
+    /// plug-in with the SAME id within a boot, so a *changed* id means the device rebooted.
+    last_session: Option<u32>,
 }
 
 /// Emit the loud, persistent protocol-mismatch banner (stderr). `device` is the version the
@@ -207,7 +210,11 @@ pub(crate) fn read_loop(
 /// Decode one frame and render it per `view`/`mode`, updating sequence + error accounting.
 /// (Kept `pub(crate)` so unit tests can drive it directly with synthesized frames.)
 pub(crate) fn render(inner: &[u8], mode: OutputMode, view: View, st: &mut RenderState) {
-    let (mt, seq, payload) = match decode_frame(inner) {
+    // `decode_msg` does the version + CRC check (like `decode_frame`) AND deserializes the
+    // payload into the typed `Msg` in one step — the consumer no longer hand-writes a
+    // `MsgType` match + `from_bytes` per arm. A CRC-valid body that fails to deserialize
+    // surfaces as `Error::Malformed` here, same drop path as a version/CRC failure.
+    let (seq, msg) = match decode_msg(inner) {
         Ok(t) => t,
         Err(e) => {
             st.decode_failures += 1;
@@ -232,7 +239,7 @@ pub(crate) fn render(inner: &[u8], mode: OutputMode, view: View, st: &mut Render
     // A `Hello` marks a new device session: the firmware resets its per-session `seq`
     // (the dynamic console re-emits `Hello` on every USB plug-in), so re-baseline our
     // tracking on it rather than reporting a spurious gap across the reconnect.
-    if matches!(mt, MsgType::Hello) {
+    if matches!(msg, Msg::Hello(_)) {
         st.last_seq = None;
     }
     if let Some(prev) = st.last_seq {
@@ -250,40 +257,30 @@ pub(crate) fn render(inner: &[u8], mode: OutputMode, view: View, st: &mut Render
     }
     st.last_seq = Some(seq);
 
-    match mt {
-        MsgType::Hello => {
-            if let Ok(h) = postcard::from_bytes::<Hello>(payload) {
-                eprintln!(
-                    "[tower] hello: firmware {:?}, protocol v{}",
-                    h.firmware_version, h.protocol_version
-                );
-                if h.protocol_version != tower_protocol::PROTOCOL_VERSION && !st.warned_mismatch {
-                    warn_protocol_mismatch(h.protocol_version);
-                    st.warned_mismatch = true;
-                }
+    match msg {
+        Msg::Hello(h) => {
+            // A changed session_id since the last Hello means the device rebooted (the console
+            // re-emits Hello with the SAME id on a mere USB re-plug within one boot).
+            let rebooted = st.last_session.is_some_and(|s| s != h.session_id);
+            st.last_session = Some(h.session_id);
+            eprintln!(
+                "[tower] hello: {} {} (protocol v{}, session {}){}",
+                h.firmware_name,
+                h.firmware_version,
+                h.protocol_version,
+                h.session_id,
+                if rebooted { " — device rebooted" } else { "" }
+            );
+            if h.protocol_version != tower_protocol::PROTOCOL_VERSION && !st.warned_mismatch {
+                warn_protocol_mismatch(h.protocol_version);
+                st.warned_mismatch = true;
             }
         }
-        MsgType::Log if view == View::Logs => {
-            if let Ok(l) = postcard::from_bytes::<Log>(payload) {
-                emit_log(&l, mode);
-            }
-        }
-        MsgType::Print if view == View::Logs => {
-            if let Ok(p) = postcard::from_bytes::<Print>(payload) {
-                emit_print(&p, mode);
-            }
-        }
-        MsgType::Dropped if view == View::Logs => {
-            if let Ok(d) = postcard::from_bytes::<Dropped>(payload) {
-                emit_dropped(&d, mode);
-            }
-        }
-        MsgType::Event if view == View::Events => {
-            if let Ok(e) = postcard::from_bytes::<Event>(payload) {
-                emit_event(&e, mode);
-            }
-        }
-        _ => {} // frames not relevant to this view (or later-phase types)
+        Msg::Log(l) if view == View::Logs => emit_log(&l, mode),
+        Msg::Print(p) if view == View::Logs => emit_print(&p, mode),
+        Msg::Dropped(d) if view == View::Logs => emit_dropped(&d, mode),
+        Msg::Event(e) if view == View::Events => emit_event(&e, mode),
+        _ => {} // frames not relevant to this view (or host→device types)
     }
 }
 
@@ -369,8 +366,8 @@ pub(crate) fn hexline(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_protocol::encode_frame;
     use tower_protocol::msg::Hello;
+    use tower_protocol::{MsgType, encode_frame};
 
     const TEXT: OutputMode = OutputMode::Text { colors: false };
 
@@ -386,7 +383,9 @@ mod tests {
             0,
             &Hello {
                 protocol_version,
+                firmware_name: "app",
                 firmware_version: "test",
+                session_id: 1,
             },
         )
     }

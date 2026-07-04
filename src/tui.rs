@@ -1304,9 +1304,9 @@ mod tests {
         // A frame tagged with a different protocol version must be counted (not silently
         // dropped) and, on the first one, shout a red banner naming the version + remedy.
         let mut app = test_app();
-        handle_frame(&mut app, &bad_version_inner(2));
+        handle_frame(&mut app, &bad_version_inner(1));
         assert_eq!(app.decode_failures, 1);
-        assert_eq!(app.mismatch_got, Some(2));
+        assert_eq!(app.mismatch_got, Some(1));
         assert!(app.warned_mismatch);
         assert!(
             app.logs

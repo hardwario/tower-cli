@@ -13,9 +13,11 @@ together, because postcard isn't self-describing (mismatched versions silently m
 
 ```sh
 # set tag = "vX.Y.Z" in Cargo.toml, then:
-mv .cargo/config.toml .cargo/config.toml.bak   # the paths override shadows the git source
+# ONLY if a local paths override exists, move it aside so it doesn't shadow the git source
+# (it's gitignored and only present during local co-dev — see "Local dev override" below):
+[ -f .cargo/config.toml ] && mv .cargo/config.toml .cargo/config.toml.bak
 cargo update -p tower-protocol                  # re-resolve the lock to the new tag
-mv .cargo/config.toml.bak .cargo/config.toml
+[ -f .cargo/config.toml.bak ] && mv .cargo/config.toml.bak .cargo/config.toml
 cargo build
 ```
 

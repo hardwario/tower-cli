@@ -92,3 +92,15 @@ fn nonexistent_device_first_open_is_fatal() {
         .code(1)
         .stderr(predicate::str::contains("error"));
 }
+
+#[test]
+fn console_nonexistent_device_first_open_is_fatal() {
+    // The console TUI honours the same "first open is fatal" contract: a bad `--device` must
+    // fail before ratatui takes the terminal (so the error prints normally and it exits 1),
+    // rather than opening an empty four-pane UI that reconnects forever.
+    tower()
+        .args(["console", "--device", "/dev/tower-cli-test-nonexistent"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error"));
+}

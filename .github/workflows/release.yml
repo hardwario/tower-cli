@@ -28,6 +28,31 @@ jobs:
             exit 1
           fi
 
+      # Gate the release on the protocol lockstep too: publishing a `tower` binary that pins a
+      # different tower-protocol tag than the deployed firmware ships a silent wire mis-decode to
+      # every user who downloads it. The build/publish jobs `need` this one, so a broken pin can't
+      # produce release archives.
+      - name: Verify tower-protocol lockstep (vs firmware)
+        run: |
+          python3 - <<'PY'
+          import re, sys, urllib.request
+          PIN = re.compile(r'tower-protocol\s*=\s*\{[^}]*?\btag\s*=\s*"([^"]+)"')
+          def tag(text, where):
+              m = PIN.search(text)
+              if not m:
+                  sys.exit(f"lockstep: no tower-protocol tag found in {where}")
+              return m.group(1)
+          with open("Cargo.toml", encoding="utf-8") as f:
+              cli = tag(f.read(), "cli/Cargo.toml")
+          url = "https://raw.githubusercontent.com/hardwario/tower-firmware/main/Cargo.toml"
+          fw = tag(urllib.request.urlopen(url, timeout=30).read().decode("utf-8"), "firmware Cargo.toml")
+          print(f"cli pins {cli}; tower-firmware pins {fw}")
+          if cli != fw:
+              sys.exit(f"ERROR: refusing to release — tower-protocol LOCKSTEP BROKEN: cli pins {cli} "
+                       f"but firmware pins {fw}. Align both before tagging a release.")
+          print(f"lockstep OK: releasing with tower-protocol {cli}")
+          PY
+
       # Gate the release on formatting so a lint failure can't ship in a tag
       # (the build/publish jobs `need` this one). fmt only parses source, so no
       # libudev/compile is required here.

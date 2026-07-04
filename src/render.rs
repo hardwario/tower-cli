@@ -212,11 +212,20 @@ pub(crate) fn render(inner: &[u8], mode: OutputMode, view: View, st: &mut Render
         Err(e) => {
             st.decode_failures += 1;
             // A version-tagged codec error is the smoking gun for a tag mismatch; surface the
-            // running count so a wall of them reads as one diagnosable cause, not noise.
-            eprintln!(
-                "[tower] dropped a corrupt frame: {e:?} ({} undecodable frame(s) — version mismatch?)",
-                st.decode_failures
-            );
+            // running count so a wall of them reads as one diagnosable cause, not noise. In
+            // JSON mode make it a first-class NDJSON record (like device-side `Dropped`) so
+            // `| jq` consumers see it on stdout, not just humans on stderr.
+            match mode {
+                OutputMode::Json => println!(
+                    "{{\"type\":\"decode_error\",\"error\":{},\"count\":{}}}",
+                    json_str(&format!("{e:?}")),
+                    st.decode_failures
+                ),
+                OutputMode::Text { .. } => eprintln!(
+                    "[tower] dropped a corrupt frame: {e:?} ({} undecodable frame(s) — version mismatch?)",
+                    st.decode_failures
+                ),
+            }
             return;
         }
     };
@@ -229,7 +238,14 @@ pub(crate) fn render(inner: &[u8], mode: OutputMode, view: View, st: &mut Render
     if let Some(prev) = st.last_seq {
         let expected = prev.wrapping_add(1);
         if seq != expected {
-            eprintln!("[tower] seq gap: expected {expected}, got {seq}");
+            match mode {
+                OutputMode::Json => {
+                    println!("{{\"type\":\"seq_gap\",\"expected\":{expected},\"got\":{seq}}}")
+                }
+                OutputMode::Text { .. } => {
+                    eprintln!("[tower] seq gap: expected {expected}, got {seq}")
+                }
+            }
         }
     }
     st.last_seq = Some(seq);
@@ -423,6 +439,40 @@ mod tests {
         bytes[last] ^= 0x80;
         feed_render(&mut st, &bytes);
         assert_eq!(st.decode_failures, 1);
+    }
+
+    /// Like [`feed_render`] but in an explicit [`OutputMode`], for the JSON-diagnostics paths.
+    fn feed_render_mode(st: &mut RenderState, mode: OutputMode, frames: &[u8]) {
+        let mut d = FrameDecoder::new();
+        for &b in frames {
+            if let Some(inner) = d.push(b) {
+                render(inner, mode, View::Logs, st);
+            }
+        }
+    }
+
+    #[test]
+    fn json_mode_emits_and_counts_decode_error() {
+        // In JSON mode a corrupt frame becomes a `decode_error` NDJSON record on stdout (like
+        // the device-side `dropped` record) rather than only a human stderr line — here we pin
+        // that it still runs the JSON branch and keeps the running count.
+        let mut st = RenderState::default();
+        let mut bytes = log_frame(0, "ok");
+        let last = bytes.len() - 2;
+        bytes[last] ^= 0x80; // break the CRC (stays COBS-decodable)
+        feed_render_mode(&mut st, OutputMode::Json, &bytes);
+        assert_eq!(st.decode_failures, 1);
+    }
+
+    #[test]
+    fn json_mode_detects_seq_gap() {
+        // A seq discontinuity in JSON mode emits a `seq_gap` NDJSON record on stdout; assert the
+        // gap is detected (state advances to the latest seq) without a Hello re-baseline.
+        let mut st = RenderState::default();
+        feed_render_mode(&mut st, OutputMode::Json, &log_frame(1, "a"));
+        feed_render_mode(&mut st, OutputMode::Json, &log_frame(5, "b")); // gap 2..=4
+        assert_eq!(st.last_seq, Some(5));
+        assert_eq!(st.decode_failures, 0);
     }
 
     #[test]

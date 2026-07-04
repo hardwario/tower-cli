@@ -40,8 +40,6 @@ enum Pane {
 
 struct App {
     port_name: String,
-    /// Reboot the app on the *first* successful open (consumed then), not on reconnects.
-    reset_pending: bool,
     sp: Option<Box<dyn serialport::SerialPort>>,
     dec: FrameDecoder,
     logs: VecDeque<(String, Color)>,
@@ -70,15 +68,28 @@ struct App {
     hint: String, // transient completion / status hint
     /// Whether we've already warned about a protocol-version mismatch (warn once per session).
     warned_mismatch: bool,
+    /// Last frame `seq` seen (any type), for gap detection; re-baselined on every `Hello`.
+    last_seq: Option<u16>,
+    /// Frames the codec refused to decode (`BadVersion`/`BadCrc`/`BadType`/…). A burst of these
+    /// on a live link is the classic tag-mismatch symptom — shown in the header, not swallowed.
+    decode_failures: u64,
+    /// Count of `seq` discontinuities (a decoded frame whose `seq` wasn't `prev + 1`).
+    seq_gaps: u64,
+    /// Frames that decoded at the frame layer but whose postcard payload failed to parse.
+    payload_errors: u64,
+    /// The version byte from the first header-level `BadVersion` seen (for the header hint).
+    mismatch_got: Option<u8>,
+    /// Last failed (re)connect error, shown next to the reconnect indicator. `None` while
+    /// connected or before the first failed attempt.
+    last_open_error: Option<String>,
     last_open_attempt: Instant,
     quit: bool,
 }
 
 impl App {
-    fn new(port_name: String, reset_pending: bool) -> Self {
+    fn new(port_name: String) -> Self {
         App {
             port_name,
-            reset_pending,
             sp: None,
             dec: FrameDecoder::new(),
             logs: VecDeque::new(),
@@ -101,6 +112,12 @@ impl App {
             pending_req: None,
             hint: String::new(),
             warned_mismatch: false,
+            last_seq: None,
+            decode_failures: 0,
+            seq_gaps: 0,
+            payload_errors: 0,
+            mismatch_got: None,
+            last_open_error: None,
             last_open_attempt: Instant::now() - Duration::from_secs(10),
             quit: false,
         }
@@ -119,8 +136,15 @@ fn push_cap<T>(buf: &mut VecDeque<T>, item: T) {
 }
 
 pub fn run(port: String, reset: bool) -> Result<()> {
+    // The FIRST open is fatal — same contract as the streaming commands: a bad `--device`
+    // (typo, EBUSY, EACCES) must exit 1 with the real OS error, not silently spin in the
+    // reconnect loop behind an empty four-pane UI. Open BEFORE ratatui grabs the terminal so
+    // the error prints normally. `--reset` is consumed here, on the initial attach; the
+    // reconnect path never re-resets (a flaky link mustn't become a reboot loop).
+    let sp = crate::port::open_console_responsive(&port, reset)?;
+    let mut app = App::new(port);
+    app.sp = Some(sp);
     let mut terminal = ratatui::init(); // raw mode + alt screen + panic-restore hook
-    let app = App::new(port, reset);
     let res = run_loop(&mut terminal, app);
     ratatui::restore();
     res
@@ -150,24 +174,22 @@ fn ensure_connected(app: &mut App) {
         return;
     }
     app.last_open_attempt = Instant::now();
-    if let Ok(mut sp) = serialport::new(&app.port_name, 115_200)
-        .timeout(Duration::from_millis(10))
-        .open()
-    {
-        // Put the lines in the known run state (shared with the other commands); on the
-        // first attach with --reset, reboot the app so its startup is captured here.
-        let _ = crate::port::set_run_baseline(&mut *sp);
-        if app.reset_pending {
-            let _ = crate::port::pulse_reset_into_app(&mut *sp);
-            app.reset_pending = false;
+    // Reconnect without re-resetting (never re-reset on a flaky link). Unlike the fatal first
+    // open in `run`, a later failure isn't fatal — we keep retrying — but we no longer drop it
+    // on the floor: stash it so the header can show *why* (EBUSY, EACCES, ENOENT, …) next to
+    // the reconnect indicator instead of a bare "reconnecting…" with a green-looking UI.
+    match crate::port::open_console_responsive(&app.port_name, false) {
+        Ok(sp) => {
+            app.sp = Some(sp);
+            app.last_open_error = None;
+            app.dec.reset();
+            // Drop any half-reassembled response from the previous connection: its remaining
+            // chunks will never arrive, and the new session restarts `cmd_id`/`chunk` at 1/0.
+            app.resp_buf.clear();
+            app.pending_cmd = None;
+            app.pending_req = None;
         }
-        app.sp = Some(sp);
-        app.dec.reset();
-        // Drop any half-reassembled response from the previous connection: its remaining
-        // chunks will never arrive, and the new session restarts `cmd_id`/`chunk` at 1/0.
-        app.resp_buf.clear();
-        app.pending_cmd = None;
-        app.pending_req = None;
+        Err(e) => app.last_open_error = Some(format!("{e:#}")),
     }
 }
 
@@ -194,9 +216,52 @@ fn drain_serial(app: &mut App) {
 }
 
 fn handle_frame(app: &mut App, inner: &[u8]) {
-    let Ok((mt, _seq, payload)) = decode_frame(inner) else {
-        return;
+    // Capture the decode error instead of dropping the frame silently: a wall of these behind a
+    // green "connected" dot is exactly the tag-mismatch symptom that used to show four empty
+    // panes. Count them (shown in the header) and, on the first header-level version mismatch,
+    // shout a red line into the log pane naming the version and the remedy.
+    let (mt, seq, payload) = match decode_frame(inner) {
+        Ok(t) => t,
+        Err(e) => {
+            app.decode_failures += 1;
+            if let tower_protocol::Error::BadVersion { got } = e {
+                app.mismatch_got = Some(got);
+                if !app.warned_mismatch {
+                    push_cap(
+                        &mut app.logs,
+                        (
+                            format!(
+                                "✖ PROTOCOL MISMATCH: device frames are tagged v{got}, but this \
+                                 `tower` was built for v{} — every frame will mis-decode. Rebuild \
+                                 the firmware and `tower` against the SAME tower-protocol tag \
+                                 (the lockstep rule).",
+                                tower_protocol::PROTOCOL_VERSION
+                            ),
+                            Color::Red,
+                        ),
+                    );
+                    app.warned_mismatch = true;
+                }
+            }
+            return;
+        }
     };
+
+    // Sequence-gap accounting (mirrors the plain-CLI renderer): a `Hello` marks a new device
+    // session and re-baselines `seq` (the console re-emits `Hello` on every USB plug-in), so a
+    // fresh 0 isn't a spurious gap. Done before the pause check because frames still arrive
+    // while paused — only their *display* is frozen.
+    if matches!(mt, MsgType::Hello) {
+        app.last_seq = None;
+    }
+    if let Some(prev) = app.last_seq {
+        // Wrapping u16 distance minus one: nonzero means at least one frame went missing.
+        if seq.wrapping_sub(prev).wrapping_sub(1) != 0 {
+            app.seq_gaps += 1;
+        }
+    }
+    app.last_seq = Some(seq);
+
     // While paused (F5), freeze the streaming panes — keep draining the port (so its
     // buffer can't overflow) but don't append. Interactive traffic (Hello, shell
     // responses/completions) still flows so the shell stays usable.
@@ -208,66 +273,64 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
         return;
     }
     match mt {
-        MsgType::Hello => {
-            // Decode the Hello (the TUI otherwise ignores it) purely to enforce the lockstep
-            // rule: on a protocol-version mismatch, postcard silently mis-decodes every frame,
-            // so surface it loudly in the log pane rather than rendering garbage.
-            if let Ok(h) = postcard::from_bytes::<Hello>(payload)
-                && h.protocol_version != tower_protocol::PROTOCOL_VERSION
-                && !app.warned_mismatch
-            {
-                push_cap(
-                    &mut app.logs,
-                    (
-                        format!(
-                            "⚠ PROTOCOL MISMATCH: device v{}, tower built for v{} — frames will \
-                             mis-decode; rebuild both against the same tower-protocol tag.",
-                            h.protocol_version,
-                            tower_protocol::PROTOCOL_VERSION
+        // Decode the Hello (the TUI otherwise ignores it) purely to enforce the lockstep rule:
+        // a payload-version mismatch is a secondary guard — a *real* tag mismatch is caught at
+        // the frame header above and never parses a Hello.
+        MsgType::Hello => match postcard::from_bytes::<Hello>(payload) {
+            Ok(h) => {
+                if h.protocol_version != tower_protocol::PROTOCOL_VERSION && !app.warned_mismatch {
+                    push_cap(
+                        &mut app.logs,
+                        (
+                            format!(
+                                "⚠ PROTOCOL MISMATCH: device v{}, tower built for v{} — frames \
+                                 will mis-decode; rebuild both against the same tower-protocol \
+                                 tag.",
+                                h.protocol_version,
+                                tower_protocol::PROTOCOL_VERSION
+                            ),
+                            Color::Red,
                         ),
-                        Color::Red,
-                    ),
-                );
-                app.warned_mismatch = true;
+                    );
+                    app.warned_mismatch = true;
+                    app.mismatch_got = Some(h.protocol_version);
+                }
             }
-        }
-        MsgType::Log => {
-            if let Ok(l) = postcard::from_bytes::<Log>(payload) {
-                // Reuse the CLI's shared layout (`[uptime] LEVEL module: message`) so both
-                // frontends render a Log identically; the TUI prepends its own clock + color.
+            Err(_) => app.payload_errors += 1,
+        },
+        MsgType::Log => match postcard::from_bytes::<Log>(payload) {
+            // Reuse the CLI's shared layout (`[uptime] LEVEL module: message`) so both
+            // frontends render a Log identically; the TUI prepends its own clock + color.
+            Ok(l) => {
                 let line = format!("{} {}", now(), crate::render::log_line(&l));
                 push_cap(&mut app.logs, (line, level_color(l.level)));
             }
-        }
-        MsgType::Print => {
-            if let Ok(p) = postcard::from_bytes::<Print>(payload) {
-                push_cap(&mut app.logs, (p.text.trim_end().to_string(), Color::Reset));
-            }
-        }
-        MsgType::Event => {
-            if let Ok(e) = postcard::from_bytes::<EvMsg>(payload) {
-                push_cap(
-                    &mut app.events,
-                    format!("{} {}  {}", now(), e.name, crate::render::event_fields(&e)),
-                );
-            }
-        }
-        MsgType::Dropped => {
-            if let Ok(d) = postcard::from_bytes::<Dropped>(payload) {
-                push_cap(
-                    &mut app.logs,
-                    (format!("⚠ {} log frame(s) dropped", d.count), Color::Yellow),
-                );
-            }
-        }
-        MsgType::ShellResponse => {
-            // Reassemble chunks (`chunk`/`last`) into one response before splitting it
-            // into lines, so a chunk boundary mid-line doesn't fragment the display.
-            if let Ok(r) = postcard::from_bytes::<ShellResponse>(payload)
-                // Only reassemble chunks for the command we're currently awaiting — a stale
-                // or overlapping response (different cmd_id) must not bleed into this one.
-                && app.pending_cmd == Some(r.cmd_id)
-            {
+            Err(_) => app.payload_errors += 1,
+        },
+        MsgType::Print => match postcard::from_bytes::<Print>(payload) {
+            Ok(p) => push_cap(&mut app.logs, (p.text.trim_end().to_string(), Color::Reset)),
+            Err(_) => app.payload_errors += 1,
+        },
+        MsgType::Event => match postcard::from_bytes::<EvMsg>(payload) {
+            Ok(e) => push_cap(
+                &mut app.events,
+                format!("{} {}  {}", now(), e.name, crate::render::event_fields(&e)),
+            ),
+            Err(_) => app.payload_errors += 1,
+        },
+        MsgType::Dropped => match postcard::from_bytes::<Dropped>(payload) {
+            Ok(d) => push_cap(
+                &mut app.logs,
+                (format!("⚠ {} log frame(s) dropped", d.count), Color::Yellow),
+            ),
+            Err(_) => app.payload_errors += 1,
+        },
+        // Reassemble chunks (`chunk`/`last`) into one response before splitting it into lines,
+        // so a chunk boundary mid-line doesn't fragment the display.
+        MsgType::ShellResponse => match postcard::from_bytes::<ShellResponse>(payload) {
+            // Only reassemble chunks for the command we're currently awaiting — a stale or
+            // overlapping response (different cmd_id) must not bleed into this one.
+            Ok(r) if app.pending_cmd == Some(r.cmd_id) => {
                 // A `chunk` gap means a middle chunk was CRC-dropped (the decoder silently
                 // discards corrupt frames): flag the truncation instead of emitting a
                 // seemingly-complete response.
@@ -293,15 +356,17 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
                     app.pending_cmd = None;
                 }
             }
-        }
-        MsgType::ShellCompletions => {
-            if let Ok(c) = postcard::from_bytes::<ShellCompletions>(payload)
-                && Some(c.req_id) == app.pending_req
-            {
+            Ok(_) => {} // a response for a different cmd_id — ignore
+            Err(_) => app.payload_errors += 1,
+        },
+        MsgType::ShellCompletions => match postcard::from_bytes::<ShellCompletions>(payload) {
+            Ok(c) if Some(c.req_id) == app.pending_req => {
                 apply_completion(app, &c);
                 app.pending_req = None;
             }
-        }
+            Ok(_) => {} // a completion for a stale req_id — ignore
+            Err(_) => app.payload_errors += 1,
+        },
         _ => {}
     }
 }
@@ -553,6 +618,28 @@ fn send_command(app: &mut App) {
         return;
     }
     let cmd_id = app.cmd_id;
+    // Try to send FIRST; only commit UI state (echo, arm reassembly, history, clear the input)
+    // if the frame actually went out. A too-long line fails to encode and a dropped link fails
+    // to write — in either case keep the typed line so the user can edit/retry, don't arm a
+    // reassembly for a command that never left, and explain why in the hint.
+    if !send_frame(
+        app,
+        MsgType::ShellCommand,
+        &ShellCommand {
+            cmd_id,
+            line: &line,
+        },
+    ) {
+        app.hint = if app.connected() {
+            format!(
+                "line too long (max ~{} bytes)",
+                tower_protocol::MAX_FRAME - 12
+            )
+        } else {
+            "send failed: link lost — reconnecting…".to_string()
+        };
+        return;
+    }
     app.cmd_id = app.cmd_id.wrapping_add(1);
     push_cap(&mut app.responses, format!("> {line}"));
     app.resp_buf.clear(); // discard any incomplete prior response
@@ -560,14 +647,6 @@ fn send_command(app: &mut App) {
     // cmd_id (a late chunk from a prior command must not bleed in), starting at chunk 0.
     app.pending_cmd = Some(cmd_id);
     app.next_chunk = 0;
-    let _ = send_frame(
-        app,
-        MsgType::ShellCommand,
-        &ShellCommand {
-            cmd_id,
-            line: &line,
-        },
-    );
     if app.history.last().map(|h| h.as_str()) != Some(line.as_str()) {
         app.history.push(line);
     }
@@ -595,6 +674,38 @@ fn send_frame<T: serde::Serialize>(app: &mut App, mt: MsgType, payload: &T) -> b
 
 // ---- rendering ----
 
+/// The header's decode/seq/payload diagnostics string, or `None` when everything's clean.
+/// e.g. `"✖ 37 bad frames (v2?) · 4 seq gaps · 2 payload errs"`.
+fn header_diagnostics(app: &App) -> Option<String> {
+    if app.decode_failures == 0 && app.seq_gaps == 0 && app.payload_errors == 0 {
+        return None;
+    }
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    let mut parts: Vec<String> = Vec::new();
+    if app.decode_failures > 0 {
+        let mut d = format!(
+            "{} bad frame{}",
+            app.decode_failures,
+            plural(app.decode_failures)
+        );
+        if let Some(v) = app.mismatch_got {
+            d.push_str(&format!(" (v{v}?)"));
+        }
+        parts.push(d);
+    }
+    if app.seq_gaps > 0 {
+        parts.push(format!("{} seq gap{}", app.seq_gaps, plural(app.seq_gaps)));
+    }
+    if app.payload_errors > 0 {
+        parts.push(format!(
+            "{} payload err{}",
+            app.payload_errors,
+            plural(app.payload_errors)
+        ));
+    }
+    Some(format!("  ✖ {}", parts.join(" · ")))
+}
+
 fn ui(f: &mut ratatui::Frame, app: &App) {
     let area = f.area();
     let bar = Style::new().bg(Color::Gray).fg(Color::Black);
@@ -606,19 +717,38 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     ])
     .split(area);
 
-    // Header.
-    let conn = if app.connected() {
-        "●"
+    // Header. Built as spans so the connection dot, a reconnect error, and the decode/seq
+    // diagnostics can each carry their own color over the gray bar.
+    let on_bar = |fg: Color| Style::new().bg(Color::Gray).fg(fg);
+    let mut spans = vec![Span::styled(
+        format!(
+            " HARDWARIO TOWER Console v{} — {} ",
+            env!("CARGO_PKG_VERSION"),
+            app.port_name
+        ),
+        bar,
+    )];
+    if app.connected() {
+        spans.push(Span::styled("●", on_bar(Color::Green)));
     } else {
-        "○ reconnecting…"
-    };
-    let header = format!(
-        " HARDWARIO TOWER Console v{} — {} {}",
-        env!("CARGO_PKG_VERSION"),
-        app.port_name,
-        conn
-    );
-    f.render_widget(Paragraph::new(header).style(bar), rows[0]);
+        spans.push(Span::styled("○ reconnecting…", bar));
+        // Surface *why* the (re)connect is failing instead of an endless bare "reconnecting…".
+        if let Some(err) = &app.last_open_error {
+            spans.push(Span::styled(
+                format!("  {}: {err}", app.port_name),
+                on_bar(Color::Red),
+            ));
+        }
+    }
+    // Decode-failure / seq-gap / payload-error tally — the tag-mismatch smoking gun, kept in
+    // view so a live-but-garbled link can't masquerade as healthy.
+    if let Some(diag) = header_diagnostics(app) {
+        spans.push(Span::styled(
+            diag,
+            on_bar(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(bar), rows[0]);
 
     if app.zoom {
         render_zoom(f, app, rows[1]);
@@ -849,7 +979,56 @@ mod tests {
     use tower_protocol::msg::{Candidate, CandidateKind, ShellResponse};
 
     fn test_app() -> App {
-        App::new("/dev/mock".to_string(), false)
+        App::new("/dev/mock".to_string())
+    }
+
+    /// A COBS-framed wire frame whose header advertises protocol version `ver` (top 3 bits of
+    /// `ver_type`) — i.e. what a firmware built against a *different* tower-protocol tag puts on
+    /// the wire. `decode_frame` rejects it at the version check (before CRC), so `handle_frame`
+    /// sees `Error::BadVersion`. Returns the deframed *inner* bytes (what `handle_frame` takes).
+    fn bad_version_inner(ver: u8) -> Vec<u8> {
+        // inner = ver_type(1) | seq(2) | payload | crc(4); min length is HDR+CRC = 7. The
+        // version check fires before CRC, so the payload/crc contents are irrelevant here.
+        let mut inner = vec![(ver << 5) | (MsgType::Hello as u8 & 0x1F), 0, 0];
+        inner.extend_from_slice(&[0, 0, 0, 0]);
+        inner
+    }
+
+    /// A deframed inner frame with a *valid* header version + CRC but a caller-supplied raw
+    /// payload — so `decode_frame` succeeds and the postcard parse is what's exercised (e.g.
+    /// an empty payload for a `Log` fails to parse → a payload error, not a frame error).
+    fn valid_inner(mt: MsgType, seq: u16, payload: &[u8]) -> Vec<u8> {
+        let mut inner = vec![(tower_protocol::PROTOCOL_VERSION << 5) | (mt as u8 & 0x1F)];
+        inner.extend_from_slice(&seq.to_le_bytes());
+        inner.extend_from_slice(payload);
+        let crc = tower_protocol::crc::crc32_ieee(&inner);
+        inner.extend_from_slice(&crc.to_le_bytes());
+        inner
+    }
+
+    /// The deframed inner bytes of a well-formed `Log` frame at sequence `seq`.
+    fn log_inner(seq: u16) -> Vec<u8> {
+        let mut buf = [0u8; tower_protocol::MAX_WIRE];
+        let n = encode_frame(
+            MsgType::Log,
+            seq,
+            &Log {
+                level: Level::Info,
+                uptime_us: 0,
+                module: "t",
+                message: "m",
+            },
+            &mut buf,
+        )
+        .unwrap();
+        let mut dec = FrameDecoder::new();
+        let mut inner = Vec::new();
+        for &b in &buf[..n] {
+            if let Some(f) = dec.push(b) {
+                inner = f.to_vec();
+            }
+        }
+        inner
     }
 
     /// Render `ui()` into an 80x24 test terminal and return the whole screen as text (rows
@@ -1116,5 +1295,106 @@ mod tests {
         handle_frame(&mut app, &resp_frame(2, 2, true, "c")); // chunk 1 missing → gap (C19)
         let joined: String = app.responses.iter().cloned().collect::<Vec<_>>().join("\n");
         assert!(joined.contains("chunk dropped"));
+    }
+
+    // ---- handle_frame: decode-failure surfacing + seq gaps + payload errors ----
+
+    #[test]
+    fn handle_frame_surfaces_bad_version() {
+        // A frame tagged with a different protocol version must be counted (not silently
+        // dropped) and, on the first one, shout a red banner naming the version + remedy.
+        let mut app = test_app();
+        handle_frame(&mut app, &bad_version_inner(2));
+        assert_eq!(app.decode_failures, 1);
+        assert_eq!(app.mismatch_got, Some(2));
+        assert!(app.warned_mismatch);
+        assert!(
+            app.logs
+                .iter()
+                .any(|(s, c)| *c == Color::Red && s.contains("PROTOCOL MISMATCH")),
+            "the first bad-version frame must push a red mismatch line"
+        );
+        // A second one bumps the count but doesn't spam a second banner.
+        handle_frame(&mut app, &bad_version_inner(2));
+        assert_eq!(app.decode_failures, 2);
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|(s, _)| s.contains("PROTOCOL MISMATCH"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn handle_frame_counts_seq_gaps() {
+        let mut app = test_app();
+        handle_frame(&mut app, &log_inner(10));
+        handle_frame(&mut app, &log_inner(11)); // contiguous — no gap
+        handle_frame(&mut app, &log_inner(20)); // jump — one gap
+        assert_eq!(app.seq_gaps, 1);
+        assert_eq!(app.last_seq, Some(20));
+    }
+
+    #[test]
+    fn handle_frame_rebaselines_seq_on_hello() {
+        // A Hello re-baselines seq tracking, so a fresh session at seq 0 after an earlier
+        // stream isn't reported as a spurious gap.
+        let mut app = test_app();
+        handle_frame(&mut app, &log_inner(100));
+        handle_frame(&mut app, &valid_inner(MsgType::Hello, 0, &[])); // empty Hello payload
+        // The empty-payload Hello counts as a payload error, but the seq re-baseline still ran.
+        assert_eq!(app.seq_gaps, 0);
+        assert_eq!(app.last_seq, Some(0));
+    }
+
+    #[test]
+    fn handle_frame_counts_payload_errors() {
+        // A frame that decodes at the frame layer (version + CRC ok) but whose payload isn't a
+        // valid Log is counted, not silently dropped.
+        let mut app = test_app();
+        handle_frame(&mut app, &valid_inner(MsgType::Log, 0, &[]));
+        assert_eq!(app.payload_errors, 1);
+        assert_eq!(app.decode_failures, 0);
+    }
+
+    // ---- ui(): decode diagnostics + reconnect error in the header (C-tui-1, C-tui-5) ----
+
+    #[test]
+    fn ui_header_shows_decode_diagnostics() {
+        let mut app = test_app();
+        app.decode_failures = 37;
+        app.mismatch_got = Some(2);
+        app.seq_gaps = 4;
+        let text = render_to_text_sized(&app, 140, 24);
+        assert!(text.contains("37 bad frames"));
+        assert!(text.contains("(v2?)"));
+        assert!(text.contains("4 seq gaps"));
+    }
+
+    #[test]
+    fn ui_header_shows_reconnect_error() {
+        let mut app = test_app(); // disconnected (sp = None)
+        app.last_open_error = Some("Device or resource busy".to_string());
+        let text = render_to_text_sized(&app, 140, 24);
+        assert!(text.contains("reconnecting"));
+        assert!(text.contains("Device or resource busy"));
+    }
+
+    // ---- send_command: a failed send must not tear down / desync the UI (C-tui-4) ----
+
+    #[test]
+    fn send_command_keeps_input_when_send_fails() {
+        // With no connection the send fails; the typed line must survive (for retry), no
+        // reassembly is armed, nothing is echoed, cmd_id doesn't advance, and a hint explains.
+        let mut app = test_app(); // sp = None
+        app.input = "/system radio".to_string();
+        app.cursor = app.input.len();
+        send_command(&mut app);
+        assert_eq!(app.input, "/system radio");
+        assert_eq!(app.pending_cmd, None);
+        assert!(app.responses.is_empty());
+        assert_eq!(app.cmd_id, 1);
+        assert!(!app.hint.is_empty());
     }
 }

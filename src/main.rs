@@ -32,7 +32,7 @@ use port::{devices, open_console, pick_port};
 use render::{
     ColorMode, OutputMode, View, hexline, read_loop, resolve_color, warn_protocol_mismatch,
 };
-use session::{await_ready, read_response, request_completions};
+use session::{Readiness, await_ready, read_response, request_completions};
 
 // ---- exit-code contract ---------------------------------------------------
 //
@@ -43,15 +43,20 @@ use session::{await_ready, read_response, request_completions};
 // `result` verbatim (1..=123), which is why the reserved codes start at 124.
 //
 //   0    ok
-//   1    tool error (I/O, bad file, encode/decode, protocol mismatch)
+//   1    tool error (I/O, bad file, encode/decode)
 //   2    usage error (bad args — emitted by clap itself)
 //   124  device command timed out (no/incomplete response)
+//   125  protocol-version mismatch (device speaks a different tower-protocol tag)
 //
-// So a device `result` can't be confused with the reserved 124, `exec` clamps a
-// device-reported non-zero result into 1..=123 (see `exec_cmd`).
+// So a device `result` can't be confused with the reserved codes, `exec` clamps a
+// device-reported non-zero result into 1..=123 (see `exec_cmd`); 124/125 stay reserved.
 const EXIT_OK: u8 = 0;
 const EXIT_ERROR: u8 = 1;
 const EXIT_DEVICE_TIMEOUT: u8 = 124;
+/// A freshly-reset device announced (or its frames were tagged with) a `tower-protocol`
+/// version this build doesn't speak — every frame would silently mis-decode, so `exec`
+/// refuses rather than emitting junk. Distinct from a plain timeout so CI can branch on it.
+const EXIT_PROTOCOL_MISMATCH: u8 = 125;
 
 /// Default per-command response timeout (`--timeout`), in milliseconds. Long enough
 /// for a slow device print, short enough that a wedged link fails a script promptly.
@@ -309,9 +314,12 @@ fn stream(
     let mut first = true;
     loop {
         eprintln!("[tower] connected {port}");
-        if let Some(s) = &send {
+        // `--send` fires ONCE, on the initial attach (as documented) — not on every
+        // auto-reconnect. Re-sending on each reconnect would double-poke the device and, worse,
+        // skip the readiness wait (which only runs on `first`), racing the boot.
+        if first && let Some(s) = &send {
             // On a reset attach, wait for the device to come up before poking it.
-            if reset && first {
+            if reset {
                 let mut dec = FrameDecoder::new();
                 await_ready(&mut *sp, &mut dec, delay);
             }
@@ -435,13 +443,24 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duratio
                 let mut c = conn.borrow_mut();
                 let Conn { sp, dec, .. } = &mut *c;
                 let mut buf = [0u8; tower_protocol::MAX_WIRE];
-                let n = encode_frame(
+                // A line too long to fit one frame fails to encode. That's a *per-line* error,
+                // not a session error: print a hint and return to the prompt instead of
+                // propagating `?` (which used to tear the whole interactive shell down).
+                let n = match encode_frame(
                     MsgType::ShellCommand,
                     seq,
                     &ShellCommand { cmd_id, line },
                     &mut buf,
-                )
-                .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
+                ) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!(
+                            "[tower] line too long (max ~{} bytes) — not sent",
+                            tower_protocol::MAX_FRAME - 12
+                        );
+                        continue;
+                    }
+                };
                 seq = seq.wrapping_add(1);
                 sp.write_all(&buf[..n])?;
                 sp.flush()?;
@@ -468,11 +487,20 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duratio
     Ok(())
 }
 
+/// A per-invocation `cmd_id` for the one-shot `exec`: the low 15 bits of the PID, never 0.
+/// A previous `tower exec` (a *different* process) used a different PID, so its late/queued
+/// `ShellResponse` — which would otherwise carry the same hardcoded `cmd_id` and satisfy this
+/// run's wait — no longer matches. 15 bits keeps clear of the `0` sentinel other paths use.
+fn exec_cmd_id() -> u16 {
+    let id = (std::process::id() & 0x7FFF) as u16;
+    if id == 0 { 1 } else { id }
+}
+
 /// Run a single shell command non-interactively: send it, print the (reassembled)
 /// response, and return an exit code (see the exit-code contract): a device-reported
-/// non-zero `result` (clamped into 1..=123 so it can't collide with our reserved 124),
-/// `EXIT_ERROR` on a truncated (chunk-dropped) response, `EXIT_DEVICE_TIMEOUT` on no/
-/// incomplete reply, else `EXIT_OK`.
+/// non-zero `result` (clamped into 1..=123 so it can't collide with our reserved 124/125),
+/// `EXIT_PROTOCOL_MISMATCH` on a version mismatch, `EXIT_ERROR` on a truncated (chunk-dropped)
+/// response, `EXIT_DEVICE_TIMEOUT` on no/incomplete reply, else `EXIT_OK`.
 fn exec_cmd(
     port: Option<String>,
     line: String,
@@ -487,23 +515,30 @@ fn exec_cmd(
         // Wait for the reset device to boot before issuing the command, so the
         // response we capture is from a known-clean state (the CI use case).
         // Fail fast on a protocol-version mismatch: `exec` feeds CI, and a mismatch means
-        // every subsequent frame silently mis-decodes — better a clear error than junk.
-        if let Some(v) = await_ready(&mut *sp, &mut dec, delay)
-            && v != tower_protocol::PROTOCOL_VERSION
-        {
+        // every subsequent frame silently mis-decodes — better a clear error than junk. A
+        // *real* mismatch is caught at the frame header (`Readiness::BadVersion`) before any
+        // `Hello` payload parses; the payload-version check below is a secondary guard.
+        let mismatch = match await_ready(&mut *sp, &mut dec, delay) {
+            Readiness::BadVersion(got) => Some(got),
+            Readiness::Hello(v) if v != tower_protocol::PROTOCOL_VERSION => Some(v),
+            Readiness::Hello(_) | Readiness::Timeout => None,
+        };
+        if let Some(v) = mismatch {
             warn_protocol_mismatch(v);
-            bail!(
-                "protocol version mismatch (device v{v}, tower v{}) — refusing to exec",
+            eprintln!(
+                "[tower] protocol version mismatch (device v{v}, tower v{}) — refusing to exec; rebuild/repin against the same tower-protocol tag",
                 tower_protocol::PROTOCOL_VERSION
             );
+            return Ok(EXIT_PROTOCOL_MISMATCH);
         }
     }
+    let cmd_id = exec_cmd_id();
     let mut buf = [0u8; tower_protocol::MAX_WIRE];
     let n = encode_frame(
         MsgType::ShellCommand,
         0,
         &ShellCommand {
-            cmd_id: 1,
+            cmd_id,
             line: &line,
         },
         &mut buf,
@@ -511,7 +546,7 @@ fn exec_cmd(
     .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
     sp.write_all(&buf[..n])?;
     sp.flush()?;
-    match read_response(&mut *sp, &mut dec, 1, timeout) {
+    match read_response(&mut *sp, &mut dec, cmd_id, timeout) {
         Some(r) => {
             print!("{}", r.text);
             if !r.text.is_empty() && !r.text.ends_with('\n') {
@@ -801,6 +836,58 @@ mod tests {
         )
     }
 
+    /// Canonical COBS encode of `inner`, plus the trailing `0x00` delimiter — the same wire
+    /// shape `encode_frame` produces. Used to forge a frame the host's own encoder can't (a
+    /// mismatched-version header always stamps the *current* version otherwise).
+    fn cobs_frame(inner: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8]; // placeholder for the first code byte
+        let mut code_pos = 0usize;
+        let mut code: u8 = 1;
+        for &b in inner {
+            if b == 0 {
+                out[code_pos] = code;
+                code_pos = out.len();
+                out.push(0);
+                code = 1;
+            } else {
+                out.push(b);
+                code += 1;
+                if code == 0xFF {
+                    out[code_pos] = code;
+                    code_pos = out.len();
+                    out.push(0);
+                    code = 1;
+                }
+            }
+        }
+        out[code_pos] = code;
+        out.push(0); // frame delimiter
+        out
+    }
+
+    /// A full wire frame whose *header* advertises protocol version `ver` (top 3 bits of
+    /// `ver_type`) — what a firmware built against a different tower-protocol tag actually puts
+    /// on the wire. `decode_frame` rejects it at the version check (before CRC), so the session
+    /// sees `Error::BadVersion` and never parses the Hello payload. `ver` must be 0..=7.
+    fn hello_wire_bad_version(ver: u8) -> Vec<u8> {
+        let mut inner = vec![(ver << 5) | (MsgType::Hello as u8 & 0x1F)];
+        inner.extend_from_slice(&0u16.to_le_bytes()); // seq 0
+        let mut pbuf = [0u8; 64];
+        let pn = postcard::to_slice(
+            &Hello {
+                protocol_version: ver,
+                firmware_version: "mismatch",
+            },
+            &mut pbuf,
+        )
+        .unwrap()
+        .len();
+        inner.extend_from_slice(&pbuf[..pn]);
+        let crc = tower_protocol::crc::crc32_ieee(&inner);
+        inner.extend_from_slice(&crc.to_le_bytes());
+        cobs_frame(&inner)
+    }
+
     fn log_frame(seq: u16, msg: &str) -> Vec<u8> {
         frame(
             MsgType::Log,
@@ -903,25 +990,90 @@ mod tests {
 
     #[test]
     fn wait_for_hello_returns_protocol_version() {
-        let mut sp = MockPort::new(hello(1));
+        // The matched-peer case: `hello()` uses the host's own encoder, so the header carries
+        // the current version and the Hello decodes cleanly.
+        let mut sp = MockPort::new(hello(tower_protocol::PROTOCOL_VERSION));
         let mut dec = FrameDecoder::new();
-        assert_eq!(wait_for_hello(&mut sp, &mut dec, SHORT), Some(1));
+        assert_eq!(
+            wait_for_hello(&mut sp, &mut dec, SHORT),
+            Readiness::Hello(tower_protocol::PROTOCOL_VERSION)
+        );
     }
 
     #[test]
     fn wait_for_hello_reports_mismatched_version() {
-        let mut sp = MockPort::new(hello(99));
+        // A REAL mismatched peer tags the frame *header* with its own version, so `decode_frame`
+        // rejects it before the Hello payload parses. Forge that on the wire — the host's own
+        // encoder always stamps the current version, so the old `hello(99)` test (payload-only
+        // mismatch, header still valid) decoded fine and never modelled a real mismatch.
+        assert_ne!(2, tower_protocol::PROTOCOL_VERSION);
+        let mut sp = MockPort::new(hello_wire_bad_version(2));
         let mut dec = FrameDecoder::new();
-        // It surfaces the *device's* version; the caller compares against PROTOCOL_VERSION.
-        assert_eq!(wait_for_hello(&mut sp, &mut dec, SHORT), Some(99));
-        assert_ne!(99, tower_protocol::PROTOCOL_VERSION);
+        assert_eq!(
+            wait_for_hello(&mut sp, &mut dec, SHORT),
+            Readiness::BadVersion(2)
+        );
+    }
+
+    #[test]
+    fn await_ready_reports_bad_version() {
+        // The readiness path (used by `exec`) propagates the mismatch so `exec` can bail fast
+        // with a distinct exit code instead of a generic timeout.
+        let mut sp = MockPort::new(hello_wire_bad_version(2));
+        let mut dec = FrameDecoder::new();
+        assert_eq!(
+            await_ready(&mut sp, &mut dec, None),
+            Readiness::BadVersion(2)
+        );
     }
 
     #[test]
     fn wait_for_hello_times_out_without_hello() {
         let mut sp = MockPort::new(log_frame(0, "not a hello"));
         let mut dec = FrameDecoder::new();
-        assert_eq!(wait_for_hello(&mut sp, &mut dec, SHORT), None);
+        assert_eq!(wait_for_hello(&mut sp, &mut dec, SHORT), Readiness::Timeout);
+    }
+
+    #[test]
+    fn exec_cmd_id_is_nonzero_and_15_bit() {
+        let id = exec_cmd_id();
+        assert_ne!(id, 0, "cmd_id 0 is a reserved sentinel");
+        assert!(id <= 0x7FFF, "cmd_id must fit the low 15 bits");
+        // Deterministic within a process (same PID) so the send and the wait agree on it.
+        assert_eq!(id, exec_cmd_id());
+    }
+
+    #[test]
+    fn overlong_shell_line_fails_encode_but_short_line_fits() {
+        // The boundary the interactive shell + TUI now tolerate per-line (print a hint, keep the
+        // prompt) instead of propagating `?` and killing the session: a line that overflows one
+        // frame fails to encode; a normal line encodes fine.
+        let mut buf = [0u8; MAX_WIRE];
+        let long = "x".repeat(300);
+        assert!(
+            encode_frame(
+                MsgType::ShellCommand,
+                0,
+                &ShellCommand {
+                    cmd_id: 1,
+                    line: &long,
+                },
+                &mut buf,
+            )
+            .is_err()
+        );
+        assert!(
+            encode_frame(
+                MsgType::ShellCommand,
+                0,
+                &ShellCommand {
+                    cmd_id: 1,
+                    line: "ok",
+                },
+                &mut buf,
+            )
+            .is_ok()
+        );
     }
 
     // ---- render: seq-gap detection + Hello re-baseline ----

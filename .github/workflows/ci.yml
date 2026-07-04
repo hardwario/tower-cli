@@ -15,6 +15,37 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # The golden rule, mirrored on the CLI side: tower-protocol is pinned by git tag here AND in
+  # tower-firmware, and postcard is not self-describing — a tag mismatch silently mis-decodes the
+  # wire. The firmware repo has its own lockstep job, but that only runs on FIRMWARE pushes, so a
+  # cli-only protocol bump would otherwise sail through green (and could even cut a release) until
+  # the next firmware push happened to catch it. This job makes the check symmetric.
+  lockstep:
+    name: tower-protocol lockstep (vs firmware)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify tower-protocol pin matches tower-firmware
+        run: |
+          python3 - <<'PY'
+          import re, sys, urllib.request
+          PIN = re.compile(r'tower-protocol\s*=\s*\{[^}]*?\btag\s*=\s*"([^"]+)"')
+          def tag(text, where):
+              m = PIN.search(text)
+              if not m:
+                  sys.exit(f"lockstep: no tower-protocol tag found in {where}")
+              return m.group(1)
+          with open("Cargo.toml", encoding="utf-8") as f:
+              cli = tag(f.read(), "cli/Cargo.toml")
+          url = "https://raw.githubusercontent.com/hardwario/tower-firmware/main/Cargo.toml"
+          fw = tag(urllib.request.urlopen(url, timeout=30).read().decode("utf-8"), "firmware Cargo.toml")
+          print(f"cli pins {cli}; tower-firmware pins {fw}")
+          if cli != fw:
+              sys.exit(f"ERROR: tower-protocol LOCKSTEP BROKEN — cli pins {cli} but firmware pins {fw}. "
+                       "The two repos MUST move together (silent mis-decode otherwise).")
+          print(f"lockstep OK: cli and tower-firmware both pin {cli}")
+          PY
+
   test:
     name: Test & lint
     runs-on: ubuntu-latest

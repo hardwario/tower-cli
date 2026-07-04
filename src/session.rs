@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use tower_protocol::msg::{CandidateKind, Hello, ShellComplete, ShellCompletions, ShellResponse};
-use tower_protocol::{FrameDecoder, MAX_WIRE, MsgType, decode_frame, encode_frame};
+use tower_protocol::{Error, FrameDecoder, MAX_WIRE, MsgType, decode_frame, encode_frame};
 
 /// The byte transport the session runs over: just `Read + Write`. A real
 /// `Box<dyn serialport::SerialPort>` already satisfies this (so production callers are
@@ -28,54 +28,84 @@ const HELLO_WAIT: Duration = Duration::from_millis(1500);
 /// and no explicit `--delay` was given.
 const DEFAULT_SETTLE: Duration = Duration::from_millis(250);
 
-/// Block until the device announces itself with a `Hello` frame (so its shell is
-/// up before we send), or `timeout`. Bytes seen meanwhile feed `dec`. Returns the
-/// announced `protocol_version` if `Hello` arrived (`None` on timeout). Only
-/// meaningful right after a reset.
+/// The outcome of waiting for a freshly-reset device to announce itself. Tri-state on purpose:
+/// a *real* protocol-version mismatch is rejected by `decode_frame` at the frame **header**
+/// (top 3 bits of `ver_type`) — it returns [`Error::BadVersion`] and the `Hello` payload never
+/// parses — so a Hello-payload comparison alone would miss it and the caller would just time
+/// out. Surfacing [`Readiness::BadVersion`] lets `exec` fail fast with a clear diagnostic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Readiness {
+    /// A `Hello` decoded cleanly; carries the `protocol_version` it announced (which the
+    /// caller still checks against its own, as a secondary guard — see `exec`).
+    Hello(u8),
+    /// `decode_frame` rejected a frame's header version: the peer speaks a different
+    /// `tower-protocol` tag. Carries the version byte actually seen on the wire.
+    BadVersion(u8),
+    /// No `Hello` (and no version-tagged frame) arrived before the timeout.
+    Timeout,
+}
+
+/// Block until the device announces itself with a `Hello` frame (so its shell is up before we
+/// send), or a header-level version mismatch is seen, or `timeout`. Bytes seen meanwhile feed
+/// `dec`. Only meaningful right after a reset.
 pub(crate) fn wait_for_hello(
     sp: &mut (impl Transport + ?Sized),
     dec: &mut FrameDecoder,
     timeout: Duration,
-) -> Option<u8> {
+) -> Readiness {
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 256];
     while Instant::now() < deadline {
         let n = match sp.read(&mut buf) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
-            Err(_) => return None,
+            Err(_) => return Readiness::Timeout,
         };
         for &b in &buf[..n] {
-            if let Some(inner) = dec.push(b)
-                && let Ok((MsgType::Hello, _, payload)) = decode_frame(inner)
-                && let Ok(h) = postcard::from_bytes::<Hello>(payload)
-            {
-                return Some(h.protocol_version);
+            if let Some(inner) = dec.push(b) {
+                match decode_frame(inner) {
+                    Ok((MsgType::Hello, _, payload)) => {
+                        if let Ok(h) = postcard::from_bytes::<Hello>(payload) {
+                            return Readiness::Hello(h.protocol_version);
+                        }
+                    }
+                    // The smoking gun for a tag mismatch: the header version didn't match, so
+                    // this (and every) frame is rejected before its payload is even read.
+                    Err(Error::BadVersion { got }) => return Readiness::BadVersion(got),
+                    _ => {}
+                }
             }
         }
     }
-    None
+    Readiness::Timeout
 }
 
 /// Get a freshly reset device ready to accept a command: wait for the boot
 /// `Hello` (self-calibrating to real boot time), then honor an explicit `--delay`
 /// as extra settle. If no `Hello` arrives, fall back to `--delay` (or a default)
-/// so we don't send into a link that isn't up yet. Returns the announced protocol
-/// version if a `Hello` arrived, so callers can enforce the lockstep rule.
+/// so we don't send into a link that isn't up yet. Returns the [`Readiness`] so callers can
+/// enforce the lockstep rule (and, for `BadVersion`, bail immediately without settling).
 pub(crate) fn await_ready(
     sp: &mut (impl Transport + ?Sized),
     dec: &mut FrameDecoder,
     delay: Option<u64>,
-) -> Option<u8> {
-    let version = wait_for_hello(sp, dec, HELLO_WAIT);
-    if version.is_some() {
-        if let Some(ms) = delay {
-            std::thread::sleep(Duration::from_millis(ms));
+) -> Readiness {
+    let readiness = wait_for_hello(sp, dec, HELLO_WAIT);
+    match readiness {
+        // A Hello arrived: honor an explicit extra settle if asked.
+        Readiness::Hello(_) => {
+            if let Some(ms) = delay {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
         }
-    } else {
-        std::thread::sleep(delay.map_or(DEFAULT_SETTLE, Duration::from_millis));
+        // Mismatch: don't settle — the caller is about to bail.
+        Readiness::BadVersion(_) => {}
+        // No Hello: fall back to a fixed settle so we don't send into a link that isn't up.
+        Readiness::Timeout => {
+            std::thread::sleep(delay.map_or(DEFAULT_SETTLE, Duration::from_millis));
+        }
     }
-    version
+    readiness
 }
 
 // ---- shell command response ------------------------------------------------

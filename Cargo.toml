@@ -16,6 +16,8 @@ serialport = "4"
 rustyline = "14"
 ratatui = "0.29"
 anyhow = "1"
+# Flash/erase progress bars (same version the standalone `jolt` CLI renders with).
+indicatif = "0.18"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 postcard = { version = "1", default-features = false }
 serde = "1"

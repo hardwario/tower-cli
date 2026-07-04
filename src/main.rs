@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -684,7 +684,16 @@ fn flash_cmd(
     opts.run = run;
     opts.go = go;
     let mut report = flash_progress(verbose);
-    jolt::flash::flash(&mut sp, &fw, &opts, &mut report).context("flashing firmware")
+    let start = Instant::now();
+    jolt::flash::flash(&mut sp, &fw, &opts, &mut report).context("flashing firmware")?;
+    // A ~45 s flash prints only live progress above; without a terminal line the caller
+    // can't tell success from a hang, so always confirm completion.
+    eprintln!(
+        "[tower] done: {} bytes in {:.1}s",
+        fw.len(),
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 fn erase_cmd(port: Option<String>, verbose: bool) -> Result<()> {
@@ -697,15 +706,77 @@ fn erase_cmd(port: Option<String>, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// A jolt flash/erase progress sink. jolt's library no longer prints (it emits `Progress`
-/// events); we render them to stderr — every event under `--verbose`, else just the chip-id
-/// milestone so a normal flash still shows the target was identified.
+/// A jolt flash/erase progress sink. jolt's library is UI-free (it emits `Progress` events);
+/// we render them with `indicatif` progress bars — the same crate the standalone `jolt` CLI
+/// uses — so a ~45 s flash shows live erase/write/verify progress instead of looking hung.
+/// `indicatif` auto-detects the terminal, so a redirected stderr (a log, a pipe) stays clean.
+/// `--verbose` dumps the raw events instead.
 fn flash_progress(verbose: bool) -> impl FnMut(jolt::flash::Progress) {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use jolt::flash::Progress;
+
+    fn pages_bar(total: usize, msg: &'static str) -> ProgressBar {
+        let bar = ProgressBar::new(total as u64);
+        bar.set_style(
+            ProgressStyle::with_template("[tower] {msg:>9} [{bar:28.cyan/blue}] {pos:>4}/{len} pages")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        bar.set_message(msg);
+        bar
+    }
+    fn bytes_bar(total: u64, msg: &'static str) -> ProgressBar {
+        let bar = ProgressBar::new(total);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "[tower] {msg:>9} [{bar:28.cyan/blue}] {bytes:>8}/{total_bytes:<8} {percent:>3}%",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        bar.set_message(msg);
+        bar
+    }
+
+    // The single bar for the active phase; swapped as erase → write → verify advance.
+    let mut bar: Option<ProgressBar> = None;
     move |p| {
         if verbose {
             eprintln!("[tower] {p:?}");
-        } else if let jolt::flash::Progress::ChipIdentified { id } = p {
-            eprintln!("[tower] chip 0x{id:03x}");
+            return;
+        }
+        match p {
+            Progress::ChipIdentified { id } => eprintln!("[tower] chip 0x{id:03x}"),
+            Progress::Erase { pages_done, pages_total } => {
+                let b = bar.get_or_insert_with(|| pages_bar(pages_total, "erasing"));
+                b.set_length(pages_total as u64);
+                b.set_position(pages_done as u64);
+                if pages_done == pages_total && let Some(b) = bar.take() {
+                    b.finish_with_message("erased");
+                }
+            }
+            Progress::Write { bytes_done, bytes_total } => {
+                let b = bar.get_or_insert_with(|| bytes_bar(bytes_total as u64, "writing"));
+                b.set_position(bytes_done as u64);
+                if bytes_done == bytes_total && let Some(b) = bar.take() {
+                    b.finish_with_message("written");
+                }
+            }
+            Progress::Verify { bytes_done, bytes_total } => {
+                let b = bar.get_or_insert_with(|| bytes_bar(bytes_total as u64, "verifying"));
+                b.set_position(bytes_done as u64);
+                if bytes_done == bytes_total && let Some(b) = bar.take() {
+                    b.finish_with_message("verified");
+                }
+            }
+            // Finish any lingering bar (e.g. verify disabled) so it doesn't outlive the flash.
+            Progress::Starting => {
+                if let Some(b) = bar.take() {
+                    b.finish_and_clear();
+                }
+            }
+            // Connecting / ConnectError (and any future variant): quiet unless --verbose.
+            _ => {}
         }
     }
 }

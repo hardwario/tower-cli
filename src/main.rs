@@ -60,9 +60,16 @@ const EXIT_DEVICE_TIMEOUT: u8 = 124;
 /// refuses rather than emitting junk. Distinct from a plain timeout so CI can branch on it.
 const EXIT_PROTOCOL_MISMATCH: u8 = 125;
 
-/// Default per-command response timeout (`--timeout`), in milliseconds. Long enough
-/// for a slow device print, short enough that a wedged link fails a script promptly.
-const DEFAULT_TIMEOUT_MS: u64 = 1500;
+/// Default per-command response timeout (`--timeout`), in milliseconds.
+///
+/// Sized above the firmware's worst-case EEPROM compaction stall (~5.2 s with the whole
+/// chip frozen — see tower-firmware docs/storage.md): any command that writes EEPROM
+/// (`settings set`, …) can land on the append that fills the KV half and pay for the whole
+/// compaction before it can respond. With the old 1.5 s default such a command *executed*
+/// but the CLI reported "no response (timeout)" — a phantom failure (2026-07-05). It is an
+/// *idle* timeout, so healthy commands still return in milliseconds; only a genuinely mute
+/// link waits the full 7 s.
+const DEFAULT_TIMEOUT_MS: u64 = 7000;
 
 #[derive(Parser)]
 #[command(name = "tower", version, about = "HARDWARIO TOWER console host")]

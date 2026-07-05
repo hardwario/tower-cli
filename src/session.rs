@@ -25,11 +25,14 @@ impl<T: Read + Write + ?Sized> Transport for T {}
 /// How long to wait for the boot `Hello` before falling back to `--delay`.
 ///
 /// Sized to the measured worst case, not the typical one: a warm boot announces in
-/// ~150 ms, but when the LSE 32 kHz crystal restarts cold the same firmware takes
-/// **~5.2 s** to its Hello (measured 2026-07-05, same board, same pulse — bimodal).
-/// The wait is event-driven (returns the moment the Hello decodes), so the ceiling
-/// costs nothing on fast boots; a short ceiling silently degraded `exec --reset`
-/// into firing the command at a device that hadn't even booted yet.
+/// ~150 ms, but every Nth boot pays the EEPROM KV **compaction CPU stall** in the
+/// session bump — ~5.2 s with the whole chip (ISRs included) frozen before the boot
+/// proceeds (bench-proven 2026-07-05: flip counter 1:1 with slow boots; the LSE
+/// crystal was ruled out by CSR forensics + a drive-strength sweep — see
+/// tower-firmware docs/storage.md). The wait is event-driven (returns the moment
+/// the Hello decodes), so the ceiling costs nothing on fast boots; a short ceiling
+/// silently degraded `exec --reset` into firing the command at a device that
+/// hadn't even booted yet.
 const HELLO_WAIT: Duration = Duration::from_millis(8000);
 /// Fallback settle when `--reset` is used on a send path but no `Hello` arrives
 /// and no explicit `--delay` was given.

@@ -42,7 +42,9 @@ struct App {
     port_name: String,
     sp: Option<Box<dyn serialport::SerialPort>>,
     dec: FrameDecoder,
-    logs: VecDeque<(String, Color)>,
+    /// Device log lines as (colored prefix `clock [uptime] LEVEL`, rest, level color) — only
+    /// the prefix is tinted, so message text stays readable at every severity.
+    logs: VecDeque<(String, String, Color)>,
     events: VecDeque<String>,
     responses: VecDeque<String>,
     input: String,
@@ -246,6 +248,7 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
                                  (the lockstep rule).",
                                 tower_protocol::PROTOCOL_VERSION
                             ),
+                            String::new(),
                             Color::Red,
                         ),
                     );
@@ -299,6 +302,7 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
                                 h.protocol_version,
                                 tower_protocol::PROTOCOL_VERSION
                             ),
+                            String::new(),
                             Color::Red,
                         ),
                     );
@@ -312,13 +316,24 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
             // Reuse the CLI's shared layout (`[uptime] LEVEL module: message`) so both
             // frontends render a Log identically; the TUI prepends its own clock + color.
             Ok(l) => {
-                let line = format!("{} {}", now(), crate::render::log_line(&l));
-                push_cap(&mut app.logs, (line, level_color(l.level)));
+                // Split so only `clock [uptime] LEVEL` carries the severity tint; the
+                // `module: message` text stays default-colored (readable at every level).
+                let prefix = format!(
+                    "{} {} {}",
+                    now(),
+                    crate::render::uptime_prefix(l.uptime_us),
+                    crate::render::level_label(l.level)
+                );
+                let rest = format!(" {}: {}", l.module, l.message);
+                push_cap(&mut app.logs, (prefix, rest, level_color(l.level)));
             }
             Err(_) => app.payload_errors += 1,
         },
         MsgType::Print => match postcard::from_bytes::<Print>(payload) {
-            Ok(p) => push_cap(&mut app.logs, (p.text.trim_end().to_string(), Color::Reset)),
+            Ok(p) => push_cap(
+                &mut app.logs,
+                (String::new(), p.text.trim_end().to_string(), Color::Reset),
+            ),
             Err(_) => app.payload_errors += 1,
         },
         MsgType::Event => match postcard::from_bytes::<EvMsg>(payload) {
@@ -331,7 +346,11 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
         MsgType::Dropped => match postcard::from_bytes::<Dropped>(payload) {
             Ok(d) => push_cap(
                 &mut app.logs,
-                (format!("⚠ {} log frame(s) dropped", d.count), Color::Yellow),
+                (
+                    format!("⚠ {} log frame(s) dropped", d.count),
+                    String::new(),
+                    Color::Yellow,
+                ),
             ),
             Err(_) => app.payload_errors += 1,
         },
@@ -795,12 +814,7 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         Span::styled("F3 Zoom", Style::new().fg(y(app.zoom)).bg(Color::Gray)),
         Span::raw("  "),
         Span::styled("F5 Pause", Style::new().fg(y(app.paused)).bg(Color::Gray)),
-        Span::raw("  F8 Clear  F10/^C Quit   "),
-        Span::raw(if app.hint.is_empty() {
-            String::new()
-        } else {
-            format!("[{}] ", app.hint)
-        }),
+        Span::raw("  F8 Clear  F10/^C Quit"),
     ]);
     let footer_area = rows[2];
     f.render_widget(Paragraph::new(footer).style(bar), footer_area);
@@ -820,17 +834,17 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
 
 fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
     let cols =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(body);
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(body);
+    // Command pane at the BOTTOM (classic REPL feel): events on top, responses grow in the
+    // middle, the input (+ its completion/status line) anchors the column.
     let left = Layout::vertical([
         Constraint::Percentage(25),
-        Constraint::Length(3),
         Constraint::Min(0),
+        Constraint::Length(4),
     ])
     .split(cols[0]);
 
     let plain = |s: &String| Line::raw(s.clone());
-    let colored =
-        |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
     render_text_pane(
         f,
         left[0],
@@ -840,16 +854,16 @@ fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
         app.scroll[1],
         plain,
     );
-    render_command(f, left[1], app);
     render_text_pane(
         f,
-        left[2],
+        left[1],
         "Shell Responses",
         app.focus == Pane::Responses,
         &app.responses,
         app.scroll[2],
-        plain,
+        |s: &String| highlight_response(s),
     );
+    render_command(f, left[2], app);
     render_text_pane(
         f,
         cols[1],
@@ -857,22 +871,36 @@ fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
         app.focus == Pane::Logs,
         &app.logs,
         app.scroll[0],
-        colored,
+        log_line_spans,
     );
 }
 
 fn render_zoom(f: &mut ratatui::Frame, app: &App, body: Rect) {
     let plain = |s: &String| Line::raw(s.clone());
-    let colored =
-        |(s, c): &(String, Color)| Line::from(Span::styled(s.clone(), Style::new().fg(*c)));
     match app.focus {
-        Pane::Logs => render_text_pane(f, body, "", false, &app.logs, app.scroll[0], colored),
-        Pane::Events => render_text_pane(f, body, "", false, &app.events, app.scroll[1], plain),
-        Pane::Responses => {
-            render_text_pane(f, body, "", false, &app.responses, app.scroll[2], plain)
+        Pane::Logs => {
+            render_text_pane(f, body, "", false, &app.logs, app.scroll[0], log_line_spans)
         }
+        Pane::Events => render_text_pane(f, body, "", false, &app.events, app.scroll[1], plain),
+        Pane::Responses => render_text_pane(
+            f,
+            body,
+            "",
+            false,
+            &app.responses,
+            app.scroll[2],
+            |s: &String| highlight_response(s),
+        ),
         Pane::Command => render_command(f, body, app),
     }
+}
+
+/// A device-log line: only the `clock [uptime] LEVEL` prefix carries the severity tint.
+fn log_line_spans((prefix, rest, c): &(String, String, Color)) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(prefix.clone(), Style::new().fg(*c)),
+        Span::raw(rest.clone()),
+    ])
 }
 
 /// How many terminal rows a line of display width `w` occupies once wrapped to `width`
@@ -963,15 +991,111 @@ fn render_command(f: &mut ratatui::Frame, area: Rect, app: &App) {
     };
     let block = Block::bordered().title("Shell Command").border_style(style);
     let inner = block.inner(area);
+    // Line 1: the input — syntax-highlighted, no prompt prefix (an empty box is an empty
+    // box); a dark-gray placeholder explains the syntax until the first keystroke.
+    let input_line = if app.input.is_empty() {
+        Line::from(Span::styled(
+            "Enter your command here… (starts with \"/\"; supports <TAB> completions)",
+            Style::new().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(highlight_command(&app.input))
+    };
+    // Line 2: completion candidates / transient status, right under the cursor where TAB
+    // results are actually looked for (they used to hide in the footer).
+    let hint_line = Line::from(Span::styled(
+        app.hint.clone(),
+        Style::new().fg(Color::DarkGray),
+    ));
     f.render_widget(
-        Paragraph::new(format!("/ {}", app.input)).block(block),
+        Paragraph::new(vec![input_line, hint_line]).block(block),
         area,
     );
     if focused {
-        // Cursor after the "/ " prefix.
-        let cx = inner.x + 2 + app.input[..app.cursor].chars().count() as u16;
+        let cx = inner.x + app.input[..app.cursor].chars().count() as u16;
         f.set_cursor_position((cx.min(inner.x + inner.width.saturating_sub(1)), inner.y));
     }
+}
+
+// ---- shell syntax highlighting --------------------------------------------
+// One color per syntactic class (shared by the input line and response lines):
+// tree paths cyan (separators dim), bare command words yellow, keys magenta,
+// values green, punctuation dark gray.
+const COL_PATH: Color = Color::Cyan;
+const COL_CMD: Color = Color::Yellow;
+const COL_KEY: Color = Color::Magenta;
+const COL_VAL: Color = Color::Green;
+const COL_PUNCT: Color = Color::DarkGray;
+
+/// Highlight a shell command line: `/system/eeprom print level=3` →
+/// path segments cyan, `/` separators dim, bare words yellow, `key=value` magenta/green.
+fn highlight_command(line: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, tok) in line.split_inclusive(' ').enumerate() {
+        let (word, trail) = match tok.strip_suffix(' ') {
+            Some(w) => (w, " "),
+            None => (tok, ""),
+        };
+        if word.is_empty() {
+            // collapsed runs of spaces
+        } else if word.contains('=') {
+            let (k, v) = word.split_once('=').unwrap();
+            spans.push(Span::styled(k.to_string(), Style::new().fg(COL_KEY)));
+            spans.push(Span::styled("=".to_string(), Style::new().fg(COL_PUNCT)));
+            spans.push(Span::styled(v.to_string(), Style::new().fg(COL_VAL)));
+        } else if word.contains('/') {
+            for part in word.split_inclusive('/') {
+                let (seg, sep) = match part.strip_suffix('/') {
+                    Some(sg) => (sg, "/"),
+                    None => (part, ""),
+                };
+                if !seg.is_empty() {
+                    spans.push(Span::styled(seg.to_string(), Style::new().fg(COL_PATH)));
+                }
+                if !sep.is_empty() {
+                    spans.push(Span::styled(sep.to_string(), Style::new().fg(COL_PUNCT)));
+                }
+            }
+        } else if i == 0 {
+            // First token without a slash: still an address into the tree.
+            spans.push(Span::styled(word.to_string(), Style::new().fg(COL_PATH)));
+        } else {
+            spans.push(Span::styled(word.to_string(), Style::new().fg(COL_CMD)));
+        }
+        if !trail.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+    }
+    spans
+}
+
+/// Highlight a shell-response line: command-syntax lines (starting with `/`, e.g. `/export`
+/// output) reuse [`highlight_command`]; `key: value` / `key = value` lines split into a
+/// magenta key, dim separator, and green value; anything else renders raw.
+fn highlight_response(line: &str) -> Line<'static> {
+    let l = line;
+    if l.starts_with('/') {
+        return Line::from(highlight_command(l));
+    }
+    if l.starts_with('>') {
+        // The local echo of the command the user sent.
+        let mut spans = vec![Span::styled("> ".to_string(), Style::new().fg(COL_PUNCT))];
+        spans.extend(highlight_command(l.trim_start_matches("> ")));
+        return Line::from(spans);
+    }
+    for sep in [" = ", ": "] {
+        if let Some((k, v)) = l.split_once(sep) {
+            // Only treat it as key/value when the key looks like one (single-ish word).
+            if !k.is_empty() && k.len() <= 24 && !k.contains("  ") {
+                return Line::from(vec![
+                    Span::styled(k.to_string(), Style::new().fg(COL_KEY)),
+                    Span::styled(sep.to_string(), Style::new().fg(COL_PUNCT)),
+                    Span::styled(v.to_string(), Style::new().fg(COL_VAL)),
+                ]);
+            }
+        }
+    }
+    Line::raw(line.to_string())
 }
 
 /// The ratatui color a Log line is tinted with, by severity. (The label text itself comes
@@ -1101,7 +1225,10 @@ mod tests {
     #[test]
     fn ui_split_shows_all_pane_titles() {
         let mut app = test_app();
-        push_cap(&mut app.logs, ("boot ok".to_string(), Color::Green));
+        push_cap(
+            &mut app.logs,
+            ("boot ok".to_string(), String::new(), Color::Green),
+        );
         push_cap(&mut app.events, "sensor temp=21".to_string());
         push_cap(&mut app.responses, "> /help".to_string());
         let text = render_to_text(&app);
@@ -1117,7 +1244,10 @@ mod tests {
         let mut app = test_app();
         app.zoom = true;
         app.focus = Pane::Logs;
-        push_cap(&mut app.logs, ("zoomed log line".to_string(), Color::Reset));
+        push_cap(
+            &mut app.logs,
+            ("zoomed log line".to_string(), String::new(), Color::Reset),
+        );
         let text = render_to_text(&app);
         assert!(text.contains("zoomed log line"));
         // In zoom, the events/responses pane borders aren't drawn.
@@ -1125,14 +1255,22 @@ mod tests {
     }
 
     #[test]
+    fn ui_empty_input_shows_placeholder() {
+        let app = test_app();
+        let text = render_to_text_sized(&app, 140, 24);
+        assert!(text.contains("Enter your command here"));
+    }
+
+    #[test]
     fn ui_paused_and_hint_render() {
         let mut app = test_app();
         app.paused = true;
         app.hint = "system  radio  gpio".to_string();
-        // Wide terminal so the right-aligned footer clock doesn't overwrite the hint region.
+        // Wide terminal so nothing truncates the hint line inside the command pane.
         let text = render_to_text_sized(&app, 140, 24);
         assert!(text.contains("F5 Pause"));
-        assert!(text.contains("[system  radio  gpio]"));
+        // The hint renders INSIDE the Shell Command pane (second inner line), not the footer.
+        assert!(text.contains("system  radio  gpio"));
     }
 
     #[test]
@@ -1144,9 +1282,15 @@ mod tests {
         app.focus = Pane::Logs;
         let wide = "X".repeat(200); // wraps to several rows at width 80
         for i in 0..40 {
-            push_cap(&mut app.logs, (format!("{i}-{wide}"), Color::Reset));
+            push_cap(
+                &mut app.logs,
+                (format!("{i}-{wide}"), String::new(), Color::Reset),
+            );
         }
-        push_cap(&mut app.logs, ("NEWEST-MARKER".to_string(), Color::Reset));
+        push_cap(
+            &mut app.logs,
+            ("NEWEST-MARKER".to_string(), String::new(), Color::Reset),
+        );
         let text = render_to_text(&app);
         assert!(
             text.contains("NEWEST-MARKER"),
@@ -1343,7 +1487,7 @@ mod tests {
         assert!(
             app.logs
                 .iter()
-                .any(|(s, c)| *c == Color::Red && s.contains("PROTOCOL MISMATCH")),
+                .any(|(s, _, c)| *c == Color::Red && s.contains("PROTOCOL MISMATCH")),
             "the first bad-version frame must push a red mismatch line"
         );
         // A second one bumps the count but doesn't spam a second banner.
@@ -1352,7 +1496,7 @@ mod tests {
         assert_eq!(
             app.logs
                 .iter()
-                .filter(|(s, _)| s.contains("PROTOCOL MISMATCH"))
+                .filter(|(s, _, _)| s.contains("PROTOCOL MISMATCH"))
                 .count(),
             1
         );

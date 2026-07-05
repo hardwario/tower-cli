@@ -66,7 +66,7 @@ pub(crate) enum OutputMode {
 // ---- shared line formatting (also used by the TUI) ----
 
 /// The uptime prefix `[   sss.mmm]` a Log line carries, from the device's microsecond clock.
-fn uptime_prefix(uptime_us: u64) -> String {
+pub(crate) fn uptime_prefix(uptime_us: u64) -> String {
     let secs = uptime_us / 1_000_000;
     let ms = (uptime_us % 1_000_000) / 1_000;
     format!("[{secs:>5}.{ms:03}]")

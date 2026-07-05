@@ -83,6 +83,11 @@ struct App {
     /// connected or before the first failed attempt.
     last_open_error: Option<String>,
     last_open_attempt: Instant,
+    /// Set when the session opened with `--reset`: the moment the pulse released. Cleared by
+    /// the first `Hello`; while set, the header animates "booting…" so a slow boot (a fallback
+    /// EEPROM compaction can hold the chip ~5 s — docs/storage.md in tower-firmware) reads as
+    /// progress, not a dead UI. Past the CLI's 8 s Hello ceiling it escalates to a warning.
+    boot_wait: Option<Instant>,
     quit: bool,
 }
 
@@ -119,6 +124,7 @@ impl App {
             mismatch_got: None,
             last_open_error: None,
             last_open_attempt: Instant::now() - Duration::from_secs(10),
+            boot_wait: None,
             quit: false,
         }
     }
@@ -144,6 +150,9 @@ pub fn run(port: String, reset: bool) -> Result<()> {
     let sp = crate::port::open_console_responsive(&port, reset)?;
     let mut app = App::new(port);
     app.sp = Some(sp);
+    if reset {
+        app.boot_wait = Some(Instant::now());
+    }
     let mut terminal = ratatui::init(); // raw mode + alt screen + panic-restore hook
     let res = run_loop(&mut terminal, app);
     ratatui::restore();
@@ -252,6 +261,7 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
     // fresh 0 isn't a spurious gap. Done before the pause check because frames still arrive
     // while paused — only their *display* is frozen.
     if matches!(mt, MsgType::Hello) {
+        app.boot_wait = None;
         app.last_seq = None;
     }
     if let Some(prev) = app.last_seq {
@@ -737,6 +747,28 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
             spans.push(Span::styled(
                 format!("  {}: {err}", app.port_name),
                 on_bar(Color::Red),
+            ));
+        }
+    }
+    // Post-reset boot wait: animated while the device is (possibly slowly) booting, loud once
+    // it exceeds the 8 s worst case the CLI tolerates (a fallback EEPROM compaction can
+    // legitimately hold the chip ~5 s — see tower-firmware docs/storage.md).
+    if let Some(t0) = app.boot_wait {
+        let el = t0.elapsed();
+        if el < Duration::from_secs(8) {
+            const SPIN: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let c = SPIN[(el.as_millis() / 100) as usize % SPIN.len()];
+            spans.push(Span::styled(
+                format!("  {c} booting… {:.1}s", el.as_secs_f32()),
+                on_bar(Color::Yellow),
+            ));
+        } else {
+            spans.push(Span::styled(
+                format!(
+                    "  ✗ no boot Hello after {:.0}s — wedged or console-less?",
+                    el.as_secs_f32()
+                ),
+                on_bar(Color::Red).add_modifier(Modifier::BOLD),
             ));
         }
     }

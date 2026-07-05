@@ -32,8 +32,10 @@ use port::{devices, open_console, pick_port};
 use render::{
     ColorMode, OutputMode, View, hexline, read_loop, resolve_color, warn_protocol_mismatch,
 };
+#[cfg(test)]
+use session::await_ready;
 use session::{
-    CompletionOutcome, ReadOutcome, Readiness, await_ready, read_response, request_completions,
+    CompletionOutcome, ReadOutcome, Readiness, await_ready_with, read_response, request_completions,
 };
 
 // ---- exit-code contract ---------------------------------------------------
@@ -70,6 +72,62 @@ const EXIT_PROTOCOL_MISMATCH: u8 = 125;
 /// *idle* timeout, so healthy commands still return in milliseconds; only a genuinely mute
 /// link waits the full 7 s.
 const DEFAULT_TIMEOUT_MS: u64 = 7000;
+
+/// Animated stderr feedback for the post-reset boot wait (up to `session::HELLO_WAIT` = 8 s;
+/// a fallback EEPROM compaction can legitimately hold the boot ~5 s). Silent for fast boots:
+/// nothing renders before 600 ms. On a TTY it redraws in place (`\r`); piped, it prints one
+/// static line so scripts/CI logs aren't spammed with animation frames.
+struct BootTicker {
+    shown: bool,
+    is_tty: bool,
+    last: Duration,
+}
+
+impl BootTicker {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            shown: false,
+            is_tty: std::io::stderr().is_terminal(),
+            last: Duration::ZERO,
+        }
+    }
+
+    fn tick(&mut self, el: Duration) {
+        if el < Duration::from_millis(600) || (el - self.last) < Duration::from_millis(200) {
+            return;
+        }
+        self.last = el;
+        if self.is_tty {
+            eprint!(
+                "\r[tower] waiting for the device to boot… {:.1}s ",
+                el.as_secs_f32()
+            );
+            self.shown = true;
+        } else if !self.shown {
+            eprintln!("[tower] waiting for the device to boot (a compaction can take ~5 s)…");
+            self.shown = true;
+        }
+    }
+
+    /// Close out the ticker line: report the boot time on success, or clear the line so a
+    /// following warning/diagnostic starts clean. No-op if nothing was ever drawn.
+    fn finish(&mut self, readiness: &Readiness) {
+        if !(self.shown && self.is_tty) {
+            return;
+        }
+        match readiness {
+            Readiness::Hello(_) => {
+                eprintln!(
+                    "\r[tower] device booted in {:.1}s                    ",
+                    self.last.as_secs_f32()
+                )
+            }
+            // Clear the in-place line; the caller's own warning/mismatch output follows.
+            _ => eprint!("\r\u{1b}[2K"),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "tower", version, about = "HARDWARIO TOWER console host")]
@@ -332,7 +390,10 @@ fn stream(
             // decode-failure path keeps counting, but the banner names the cause up front).
             if reset {
                 let mut dec = FrameDecoder::new();
-                match await_ready(&mut *sp, &mut dec, delay) {
+                let mut ticker = BootTicker::new();
+                let readiness = await_ready_with(&mut *sp, &mut dec, delay, |el| ticker.tick(el));
+                ticker.finish(&readiness);
+                match readiness {
                     Readiness::BadVersion(got) => warn_protocol_mismatch(got),
                     Readiness::Hello(v) if v != tower_protocol::PROTOCOL_VERSION => {
                         warn_protocol_mismatch(v)
@@ -442,7 +503,10 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duratio
         // to open it at all on a protocol mismatch (same rule as `exec`): every command
         // would otherwise just time out mute, which is exactly how the stale-binary
         // lockstep incident presented.
-        let mismatch = match await_ready(&mut *sp, &mut dec, delay) {
+        let mut ticker = BootTicker::new();
+        let readiness = await_ready_with(&mut *sp, &mut dec, delay, |el| ticker.tick(el));
+        ticker.finish(&readiness);
+        let mismatch = match readiness {
             Readiness::BadVersion(got) => Some(got),
             Readiness::Hello(v) if v != tower_protocol::PROTOCOL_VERSION => Some(v),
             Readiness::Hello(_) | Readiness::Timeout => None,
@@ -571,7 +635,10 @@ fn exec_cmd(
         // every subsequent frame silently mis-decodes — better a clear error than junk. A
         // *real* mismatch is caught at the frame header (`Readiness::BadVersion`) before any
         // `Hello` payload parses; the payload-version check below is a secondary guard.
-        let mismatch = match await_ready(&mut *sp, &mut dec, delay) {
+        let mut ticker = BootTicker::new();
+        let readiness = await_ready_with(&mut *sp, &mut dec, delay, |el| ticker.tick(el));
+        ticker.finish(&readiness);
+        let mismatch = match readiness {
             Readiness::BadVersion(got) => Some(got),
             Readiness::Hello(v) if v != tower_protocol::PROTOCOL_VERSION => Some(v),
             Readiness::Hello(_) | Readiness::Timeout => None,

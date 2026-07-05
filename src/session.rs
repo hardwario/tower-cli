@@ -68,14 +68,30 @@ pub(crate) enum Readiness {
 /// Block until the device announces itself with a `Hello` frame (so its shell is up before we
 /// send), or a header-level version mismatch is seen, or `timeout`. Bytes seen meanwhile feed
 /// `dec`. Only meaningful right after a reset.
+/// Tick-less convenience wrapper (production callers all animate; the unit tests don't).
+#[cfg(test)]
 pub(crate) fn wait_for_hello(
     sp: &mut (impl Transport + ?Sized),
     dec: &mut FrameDecoder,
     timeout: Duration,
 ) -> Readiness {
-    let deadline = Instant::now() + timeout;
+    wait_for_hello_with(sp, dec, timeout, |_| {})
+}
+
+/// [`wait_for_hello`] with a progress callback, invoked with the elapsed wait roughly at the
+/// port's read-timeout cadence — the boot can legitimately take seconds (worst case a fallback
+/// EEPROM compaction ≈ 5 s), so interactive callers animate the wait instead of sitting mute.
+pub(crate) fn wait_for_hello_with(
+    sp: &mut (impl Transport + ?Sized),
+    dec: &mut FrameDecoder,
+    timeout: Duration,
+    mut on_tick: impl FnMut(Duration),
+) -> Readiness {
+    let start = Instant::now();
+    let deadline = start + timeout;
     let mut buf = [0u8; 256];
     while Instant::now() < deadline {
+        on_tick(start.elapsed());
         let n = match sp.read(&mut buf) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
@@ -105,12 +121,24 @@ pub(crate) fn wait_for_hello(
 /// as extra settle. If no `Hello` arrives, fall back to `--delay` (or a default)
 /// so we don't send into a link that isn't up yet. Returns the [`Readiness`] so callers can
 /// enforce the lockstep rule (and, for `BadVersion`, bail immediately without settling).
+/// Tick-less convenience wrapper (production callers all animate; the unit tests don't).
+#[cfg(test)]
 pub(crate) fn await_ready(
     sp: &mut (impl Transport + ?Sized),
     dec: &mut FrameDecoder,
     delay: Option<u64>,
 ) -> Readiness {
-    let readiness = wait_for_hello(sp, dec, HELLO_WAIT);
+    await_ready_with(sp, dec, delay, |_| {})
+}
+
+/// [`await_ready`] with a boot-wait progress callback (see [`wait_for_hello_with`]).
+pub(crate) fn await_ready_with(
+    sp: &mut (impl Transport + ?Sized),
+    dec: &mut FrameDecoder,
+    delay: Option<u64>,
+    on_tick: impl FnMut(Duration),
+) -> Readiness {
+    let readiness = wait_for_hello_with(sp, dec, HELLO_WAIT, on_tick);
     match readiness {
         // A Hello arrived: guard against the boot-burst deaf window (see POST_HELLO_GUARD),
         // extended by an explicit `--delay` if the caller asked for more.

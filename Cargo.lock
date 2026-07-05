@@ -299,6 +299,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cobs"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd93fd2c1b27acd030440c9dbd9d14c1122aad622374fe05a670b67a4bc034be"
+dependencies = [
+ "heapless",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,7 +1311,7 @@ version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6764c3b5dd454e283a30e6dfe78e9b31096d9e32036b5d1eaac7a6119ccb9a24"
 dependencies = [
- "cobs",
+ "cobs 0.3.0",
  "serde",
 ]
 
@@ -1944,10 +1954,10 @@ dependencies = [
 
 [[package]]
 name = "tower-protocol"
-version = "1.1.0"
-source = "git+https://github.com/hardwario/tower-protocol?tag=v1.1.0#e4d91cea7b7d085c69384494baaf3b7eaf04e75d"
+version = "1.2.1"
+source = "git+https://github.com/hardwario/tower-protocol?tag=v1.2.1#95aa0c54e3cf05ec9816ccb9f52f90e5dcdfcda4"
 dependencies = [
- "cobs",
+ "cobs 0.5.1",
  "heapless",
  "postcard",
  "serde",

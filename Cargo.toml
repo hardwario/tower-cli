@@ -2,6 +2,7 @@
 name = "tower-cli"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.85"
 description = "HARDWARIO TOWER console host CLI (`tower`): renders the framed serial link from the tower firmware."
 license = "MIT"
 repository = "https://github.com/hardwario/tower-cli"
@@ -26,7 +27,7 @@ serde = "1"
 # pinned to a tag so a standalone clone builds reproducibly. Bump in lockstep with any wire
 # change. For side-by-side development against a local checkout, see `.cargo/config.toml`
 # (gitignored `paths` override) — it doesn't touch Cargo.lock or affect other clones.
-tower-protocol = { git = "https://github.com/hardwario/tower-protocol", tag = "v1.1.0" }
+tower-protocol = { git = "https://github.com/hardwario/tower-protocol", tag = "v1.2.1" }
 # STM32L0 UART-bootloader engine (flash / erase / reset), shared with the standalone
 # `jolt` CLI. Pinned to a tag so a standalone clone builds reproducibly, like
 # tower-protocol above. For side-by-side dev against a local checkout, see the

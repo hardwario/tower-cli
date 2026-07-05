@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serialport = "4"
-rustyline = "14"
-ratatui = "0.29"
+rustyline = "18"
+ratatui = "0.30"
 anyhow = "1"
 # Flash/erase progress bars (same version the standalone `jolt` CLI renders with).
 indicatif = "0.18"

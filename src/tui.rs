@@ -32,8 +32,8 @@ const CAP: usize = 5000; // scrollback per pane
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pane {
-    Command,
-    Responses,
+    /// The merged SSH-style shell: scrollback (echo + responses) + a "> " prompt + hints.
+    Shell,
     Events,
     Logs,
 }
@@ -106,7 +106,7 @@ impl App {
             cursor: 0,
             history: Vec::new(),
             hist_idx: None,
-            focus: Pane::Command,
+            focus: Pane::Shell,
             zoom: false,
             paused: false,
             scroll: [0; 3],
@@ -141,6 +141,23 @@ fn push_cap<T>(buf: &mut VecDeque<T>, item: T) {
         buf.pop_front();
     }
     buf.push_back(item);
+}
+
+/// Append to Device Logs. While paused (F5), bump the scroll offset so the visible window
+/// stays anchored — capture continues, only the view is frozen.
+fn push_log(app: &mut App, item: (String, String, Color)) {
+    push_cap(&mut app.logs, item);
+    if app.paused {
+        app.scroll[0] = app.scroll[0].saturating_add(1);
+    }
+}
+
+/// Append to Device Events — same paused-anchor rule as [`push_log`].
+fn push_event(app: &mut App, item: String) {
+    push_cap(&mut app.events, item);
+    if app.paused {
+        app.scroll[1] = app.scroll[1].saturating_add(1);
+    }
 }
 
 pub fn run(port: String, reset: bool) -> Result<()> {
@@ -275,16 +292,6 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
     }
     app.last_seq = Some(seq);
 
-    // While paused (F5), freeze the streaming panes — keep draining the port (so its
-    // buffer can't overflow) but don't append. Interactive traffic (Hello, shell
-    // responses/completions) still flows so the shell stays usable.
-    let streaming = matches!(
-        mt,
-        MsgType::Log | MsgType::Print | MsgType::Event | MsgType::Dropped
-    );
-    if app.paused && streaming {
-        return;
-    }
     match mt {
         // Decode the Hello (the TUI otherwise ignores it) purely to enforce the lockstep rule:
         // a payload-version mismatch is a secondary guard — a *real* tag mismatch is caught at
@@ -325,27 +332,27 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
                     crate::render::level_label(l.level)
                 );
                 let rest = format!(" {}: {}", l.module, l.message);
-                push_cap(&mut app.logs, (prefix, rest, level_color(l.level)));
+                push_log(app, (prefix, rest, level_color(l.level)));
             }
             Err(_) => app.payload_errors += 1,
         },
         MsgType::Print => match postcard::from_bytes::<Print>(payload) {
-            Ok(p) => push_cap(
-                &mut app.logs,
+            Ok(p) => push_log(
+                app,
                 (String::new(), p.text.trim_end().to_string(), Color::Reset),
             ),
             Err(_) => app.payload_errors += 1,
         },
         MsgType::Event => match postcard::from_bytes::<EvMsg>(payload) {
-            Ok(e) => push_cap(
-                &mut app.events,
+            Ok(e) => push_event(
+                app,
                 format!("{} {}  {}", now(), e.name, crate::render::event_fields(&e)),
             ),
             Err(_) => app.payload_errors += 1,
         },
         MsgType::Dropped => match postcard::from_bytes::<Dropped>(payload) {
-            Ok(d) => push_cap(
-                &mut app.logs,
+            Ok(d) => push_log(
+                app,
                 (
                     format!("⚠ {} log frame(s) dropped", d.count),
                     String::new(),
@@ -454,24 +461,37 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             return;
         }
         KeyCode::F(5) => {
+            // Pause freezes the streaming VIEWPORTS only — frames keep arriving and keep
+            // being captured (the paused-anchor in push_log/push_event holds the view
+            // still). Unpausing jumps back to the live tail.
             app.paused = !app.paused;
+            if !app.paused {
+                app.scroll[0] = 0;
+                app.scroll[1] = 0;
+            }
             return;
         }
         KeyCode::F(8) => {
-            match app.focus {
-                Pane::Logs => app.logs.clear(),
-                Pane::Events => app.events.clear(),
-                Pane::Responses => app.responses.clear(),
-                Pane::Command => {}
+            if mods.contains(KeyModifiers::SHIFT) {
+                // Shift-F8: clear every text area at once.
+                app.logs.clear();
+                app.events.clear();
+                app.responses.clear();
+                app.scroll = [0; 3];
+            } else {
+                match app.focus {
+                    Pane::Logs => app.logs.clear(),
+                    Pane::Events => app.events.clear(),
+                    Pane::Shell => app.responses.clear(),
+                }
             }
             return;
         }
         KeyCode::BackTab => {
             app.focus = match app.focus {
-                Pane::Command => Pane::Responses,
-                Pane::Responses => Pane::Events,
+                Pane::Shell => Pane::Events,
                 Pane::Events => Pane::Logs,
-                Pane::Logs => Pane::Command,
+                Pane::Logs => Pane::Shell,
             };
             return;
         }
@@ -479,7 +499,7 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     }
 
     match app.focus {
-        Pane::Command => handle_command_key(app, code, mods),
+        Pane::Shell => handle_command_key(app, code, mods),
         pane => handle_scroll_key(app, pane, code),
     }
 }
@@ -488,8 +508,7 @@ fn handle_scroll_key(app: &mut App, pane: Pane, code: KeyCode) {
     let idx = match pane {
         Pane::Logs => 0,
         Pane::Events => 1,
-        Pane::Responses => 2,
-        Pane::Command => return,
+        Pane::Shell => return, // shell scrolling is handled in handle_command_key
     };
     match code {
         KeyCode::PageUp => app.scroll[idx] = app.scroll[idx].saturating_add(10),
@@ -518,6 +537,10 @@ fn handle_command_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         return;
     }
     match code {
+        // Scroll the shell scrollback without leaving the prompt (arrows stay for
+        // history/cursor; paging is free).
+        KeyCode::PageUp => app.scroll[2] = app.scroll[2].saturating_add(10),
+        KeyCode::PageDown => app.scroll[2] = app.scroll[2].saturating_sub(10),
         KeyCode::Char(ch) => {
             app.input.insert(app.cursor, ch);
             app.cursor += ch.len_utf8();
@@ -807,14 +830,30 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         render_split(f, app, rows[1]);
     }
 
-    // Footer.
-    let y = |on: bool| if on { Color::Yellow } else { Color::Black };
+    // Footer. Toggleable items render as chips: gray when off, yellow with white bold text
+    // when active (fg-yellow-on-gray was unreadable).
+    let chip = |label: &str, on: bool| {
+        if on {
+            Span::styled(
+                format!(" {label} "),
+                Style::new()
+                    .fg(Color::White)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                format!(" {label} "),
+                Style::new().fg(Color::Black).bg(Color::Gray),
+            )
+        }
+    };
     let footer = Line::from(vec![
-        Span::raw(" Shift-Tab Focus  "),
-        Span::styled("F3 Zoom", Style::new().fg(y(app.zoom)).bg(Color::Gray)),
+        Span::raw(" <Shift-Tab> Focus  "),
+        chip("<F3> Zoom", app.zoom),
         Span::raw("  "),
-        Span::styled("F5 Pause", Style::new().fg(y(app.paused)).bg(Color::Gray)),
-        Span::raw("  F8 Clear  F10/^C Quit"),
+        chip("<F5> Pause", app.paused),
+        Span::raw("  <F8> Clear  <Shift-F8> Clear All  <PgUp/PgDn> Scroll  <F10>/<^C> Quit"),
     ]);
     let footer_area = rows[2];
     f.render_widget(Paragraph::new(footer).style(bar), footer_area);
@@ -835,14 +874,7 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
 fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
     let cols =
         Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(body);
-    // Command pane at the BOTTOM (classic REPL feel): events on top, responses grow in the
-    // middle, the input (+ its completion/status line) anchors the column.
-    let left = Layout::vertical([
-        Constraint::Percentage(25),
-        Constraint::Min(0),
-        Constraint::Length(4),
-    ])
-    .split(cols[0]);
+    let left = Layout::vertical([Constraint::Percentage(25), Constraint::Min(0)]).split(cols[0]);
 
     let plain = |s: &String| Line::raw(s.clone());
     render_text_pane(
@@ -854,16 +886,7 @@ fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
         app.scroll[1],
         plain,
     );
-    render_text_pane(
-        f,
-        left[1],
-        "Shell Responses",
-        app.focus == Pane::Responses,
-        &app.responses,
-        app.scroll[2],
-        |s: &String| highlight_response(s),
-    );
-    render_command(f, left[2], app);
+    render_shell(f, left[1], app);
     render_text_pane(
         f,
         cols[1],
@@ -882,16 +905,7 @@ fn render_zoom(f: &mut ratatui::Frame, app: &App, body: Rect) {
             render_text_pane(f, body, "", false, &app.logs, app.scroll[0], log_line_spans)
         }
         Pane::Events => render_text_pane(f, body, "", false, &app.events, app.scroll[1], plain),
-        Pane::Responses => render_text_pane(
-            f,
-            body,
-            "",
-            false,
-            &app.responses,
-            app.scroll[2],
-            |s: &String| highlight_response(s),
-        ),
-        Pane::Command => render_command(f, body, app),
+        Pane::Shell => render_shell(f, body, app),
     }
 }
 
@@ -982,38 +996,85 @@ fn render_text_pane<T>(
     f.render_widget(p, area);
 }
 
-fn render_command(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let focused = app.focus == Pane::Command;
+fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let focused = app.focus == Pane::Shell;
     let style = if focused {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
         Style::new()
     };
-    let block = Block::bordered().title("Shell Command").border_style(style);
+    let block = Block::bordered()
+        .title("Interactive Shell")
+        .border_style(style);
     let inner = block.inner(area);
-    // Line 1: the input — syntax-highlighted, no prompt prefix (an empty box is an empty
-    // box); a dark-gray placeholder explains the syntax until the first keystroke.
-    let input_line = if app.input.is_empty() {
-        Line::from(Span::styled(
-            "Enter your command here… (starts with \"/\"; supports <TAB> completions)",
-            Style::new().fg(Color::DarkGray),
-        ))
+    f.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    // Bottom-up allocation, SSH-style: the prompt is always the last row (plus hint rows
+    // right under it while completions/status are showing); everything above is scrollback.
+    let hint_rows: u16 = if app.hint.is_empty() {
+        0
     } else {
-        Line::from(highlight_command(&app.input))
+        let w = inner.width.max(1) as usize;
+        (app.hint.chars().count().div_ceil(w) as u16).min(3)
     };
-    // Line 2: completion candidates / transient status, right under the cursor where TAB
-    // results are actually looked for (they used to hide in the footer).
-    let hint_line = Line::from(Span::styled(
-        app.hint.clone(),
-        Style::new().fg(Color::DarkGray),
-    ));
-    f.render_widget(
-        Paragraph::new(vec![input_line, hint_line]).block(block),
-        area,
+    let hint_rows = hint_rows.min(inner.height.saturating_sub(1));
+    let rows = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(hint_rows),
+    ])
+    .split(inner);
+
+    // Scrollback: the command echoes ("> …") and responses, syntax-highlighted, borderless
+    // (the surrounding block is already drawn).
+    render_text_pane(
+        f,
+        rows[0],
+        "",
+        false,
+        &app.responses,
+        app.scroll[2],
+        |s: &String| highlight_response(s),
     );
+
+    // Prompt line: "> " + the input (highlighted), or the placeholder on an empty line.
+    let prompt = Span::styled(
+        "> ".to_string(),
+        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+    );
+    let line = if app.input.is_empty() {
+        Line::from(vec![
+            prompt,
+            Span::styled(
+                "Enter your command here… (starts with \"/\"; supports <TAB> completions)",
+                Style::new().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        let mut spans = vec![prompt];
+        spans.extend(highlight_command(&app.input));
+        Line::from(spans)
+    };
+    f.render_widget(Paragraph::new(line), rows[1]);
+
+    if hint_rows > 0 {
+        f.render_widget(
+            Paragraph::new(app.hint.clone())
+                .style(Style::new().fg(Color::DarkGray))
+                .wrap(Wrap { trim: false }),
+            rows[2],
+        );
+    }
+
     if focused {
-        let cx = inner.x + app.input[..app.cursor].chars().count() as u16;
-        f.set_cursor_position((cx.min(inner.x + inner.width.saturating_sub(1)), inner.y));
+        let cx = rows[1].x + 2 + app.input[..app.cursor].chars().count() as u16;
+        f.set_cursor_position((
+            cx.min(rows[1].x + rows[1].width.saturating_sub(1)),
+            rows[1].y,
+        ));
     }
 }
 
@@ -1219,7 +1280,7 @@ mod tests {
         assert!(text.contains("reconnecting"));
         assert!(text.contains("/dev/mock"));
         // Footer hint mentions the new quit binding.
-        assert!(text.contains("^C"));
+        assert!(text.contains("<F8> Clear"));
     }
 
     #[test]
@@ -1234,8 +1295,7 @@ mod tests {
         let text = render_to_text(&app);
         assert!(text.contains("Device Logs"));
         assert!(text.contains("Device Events"));
-        assert!(text.contains("Shell Responses"));
-        assert!(text.contains("Shell Command"));
+        assert!(text.contains("Interactive Shell"));
         assert!(text.contains("boot ok"));
     }
 
@@ -1255,6 +1315,35 @@ mod tests {
     }
 
     #[test]
+    fn pause_keeps_capturing_and_anchors_the_view() {
+        // F5 freezes the VIEWPORT only: frames keep landing in the buffer, and the scroll
+        // offset grows so the visible window stays put; unpausing jumps back to the tail.
+        let mut app = test_app();
+        app.paused = true;
+        let before = app.logs.len();
+        handle_frame(&mut app, &log_inner(1));
+        assert_eq!(
+            app.logs.len(),
+            before + 1,
+            "capture must continue while paused"
+        );
+        assert_eq!(app.scroll[0], 1, "view must stay anchored while paused");
+        handle_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        assert!(!app.paused);
+        assert_eq!(app.scroll[0], 0, "unpausing resumes the live tail");
+    }
+
+    #[test]
+    fn shift_f8_clears_all_panes() {
+        let mut app = test_app();
+        push_cap(&mut app.logs, ("x".into(), String::new(), Color::Reset));
+        push_cap(&mut app.events, "e".to_string());
+        push_cap(&mut app.responses, "r".to_string());
+        handle_key(&mut app, KeyCode::F(8), KeyModifiers::SHIFT);
+        assert!(app.logs.is_empty() && app.events.is_empty() && app.responses.is_empty());
+    }
+
+    #[test]
     fn ui_empty_input_shows_placeholder() {
         let app = test_app();
         let text = render_to_text_sized(&app, 140, 24);
@@ -1268,7 +1357,7 @@ mod tests {
         app.hint = "system  radio  gpio".to_string();
         // Wide terminal so nothing truncates the hint line inside the command pane.
         let text = render_to_text_sized(&app, 140, 24);
-        assert!(text.contains("F5 Pause"));
+        assert!(text.contains("<F5> Pause"));
         // The hint renders INSIDE the Shell Command pane (second inner line), not the footer.
         assert!(text.contains("system  radio  gpio"));
     }

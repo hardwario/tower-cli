@@ -23,10 +23,27 @@ pub(crate) trait Transport: Read + Write {}
 impl<T: Read + Write + ?Sized> Transport for T {}
 
 /// How long to wait for the boot `Hello` before falling back to `--delay`.
-const HELLO_WAIT: Duration = Duration::from_millis(1500);
+///
+/// Sized to the measured worst case, not the typical one: a warm boot announces in
+/// ~150 ms, but when the LSE 32 kHz crystal restarts cold the same firmware takes
+/// **~5.2 s** to its Hello (measured 2026-07-05, same board, same pulse — bimodal).
+/// The wait is event-driven (returns the moment the Hello decodes), so the ceiling
+/// costs nothing on fast boots; a short ceiling silently degraded `exec --reset`
+/// into firing the command at a device that hadn't even booted yet.
+const HELLO_WAIT: Duration = Duration::from_millis(8000);
 /// Fallback settle when `--reset` is used on a send path but no `Hello` arrives
 /// and no explicit `--delay` was given.
 const DEFAULT_SETTLE: Duration = Duration::from_millis(250);
+/// Guard settle after a post-reset `Hello` before the first host→device send.
+///
+/// Right after the boot `Hello`, a chatty firmware drains its whole boot log backlog
+/// in one burst; while that flood saturates the UART ISR, host→device bytes can be
+/// lost to receiver overrun, so a command sent immediately after the Hello vanishes
+/// without a trace (measured window ≤ ~60 ms on console_full; zero on quiet
+/// firmwares like blinky — 2026-07-05 wire probe). 150 ms is 2.5× the measured
+/// worst case and imperceptible next to the reset itself. An explicit `--delay`
+/// extends (never shortens) this guard.
+const POST_HELLO_GUARD: Duration = Duration::from_millis(150);
 
 /// The outcome of waiting for a freshly-reset device to announce itself. Tri-state on purpose:
 /// a *real* protocol-version mismatch is rejected by `decode_frame` at the frame **header**
@@ -92,16 +109,22 @@ pub(crate) fn await_ready(
 ) -> Readiness {
     let readiness = wait_for_hello(sp, dec, HELLO_WAIT);
     match readiness {
-        // A Hello arrived: honor an explicit extra settle if asked.
+        // A Hello arrived: guard against the boot-burst deaf window (see POST_HELLO_GUARD),
+        // extended by an explicit `--delay` if the caller asked for more.
         Readiness::Hello(_) => {
-            if let Some(ms) = delay {
-                std::thread::sleep(Duration::from_millis(ms));
-            }
+            std::thread::sleep(POST_HELLO_GUARD.max(Duration::from_millis(delay.unwrap_or(0))));
         }
         // Mismatch: don't settle — the caller is about to bail.
         Readiness::BadVersion(_) => {}
-        // No Hello: fall back to a fixed settle so we don't send into a link that isn't up.
+        // No Hello even at the worst-case ceiling: the device may be wedged, held in reset,
+        // or running firmware with no console. Say so — the send that follows is a best-effort
+        // shot in the dark, and the old silent fallback made this indistinguishable from a
+        // healthy send that got no reply.
         Readiness::Timeout => {
+            eprintln!(
+                "[tower] no boot Hello within {}s of the reset — device wedged or console-less? sending anyway",
+                HELLO_WAIT.as_secs()
+            );
             std::thread::sleep(delay.map_or(DEFAULT_SETTLE, Duration::from_millis));
         }
     }

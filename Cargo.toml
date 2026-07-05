@@ -31,7 +31,7 @@ tower-protocol = { git = "https://github.com/hardwario/tower-protocol", tag = "v
 # `jolt` CLI. Pinned to a tag so a standalone clone builds reproducibly, like
 # tower-protocol above. For side-by-side dev against a local checkout, see the
 # `.cargo/config.toml` `paths` override.
-jolt = { git = "https://github.com/hardwario/jolt", tag = "v1.3.0", default-features = false }
+jolt = { git = "https://github.com/hardwario/jolt", tag = "v1.4.0", default-features = false }
 
 [dev-dependencies]
 # Tests build wire frames with the protocol's own message types; `ShellCompletions`/`Event`

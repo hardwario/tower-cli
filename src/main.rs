@@ -718,9 +718,11 @@ fn flash_progress(verbose: bool) -> impl FnMut(jolt::flash::Progress) {
     fn pages_bar(total: usize, msg: &'static str) -> ProgressBar {
         let bar = ProgressBar::new(total as u64);
         bar.set_style(
-            ProgressStyle::with_template("[tower] {msg:>9} [{bar:28.cyan/blue}] {pos:>4}/{len} pages")
-                .unwrap()
-                .progress_chars("=>-"),
+            ProgressStyle::with_template(
+                "[tower] {msg:>9} [{bar:28.cyan/blue}] {pos:>4}/{len} pages",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
         );
         bar.set_message(msg);
         bar
@@ -747,25 +749,40 @@ fn flash_progress(verbose: bool) -> impl FnMut(jolt::flash::Progress) {
         }
         match p {
             Progress::ChipIdentified { id } => eprintln!("[tower] chip 0x{id:03x}"),
-            Progress::Erase { pages_done, pages_total } => {
+            Progress::Erase {
+                pages_done,
+                pages_total,
+            } => {
                 let b = bar.get_or_insert_with(|| pages_bar(pages_total, "erasing"));
                 b.set_length(pages_total as u64);
                 b.set_position(pages_done as u64);
-                if pages_done == pages_total && let Some(b) = bar.take() {
+                if pages_done == pages_total
+                    && let Some(b) = bar.take()
+                {
                     b.finish_with_message("erased");
                 }
             }
-            Progress::Write { bytes_done, bytes_total } => {
+            Progress::Write {
+                bytes_done,
+                bytes_total,
+            } => {
                 let b = bar.get_or_insert_with(|| bytes_bar(bytes_total as u64, "writing"));
                 b.set_position(bytes_done as u64);
-                if bytes_done == bytes_total && let Some(b) = bar.take() {
+                if bytes_done == bytes_total
+                    && let Some(b) = bar.take()
+                {
                     b.finish_with_message("written");
                 }
             }
-            Progress::Verify { bytes_done, bytes_total } => {
+            Progress::Verify {
+                bytes_done,
+                bytes_total,
+            } => {
                 let b = bar.get_or_insert_with(|| bytes_bar(bytes_total as u64, "verifying"));
                 b.set_position(bytes_done as u64);
-                if bytes_done == bytes_total && let Some(b) = bar.take() {
+                if bytes_done == bytes_total
+                    && let Some(b) = bar.take()
+                {
                     b.finish_with_message("verified");
                 }
             }

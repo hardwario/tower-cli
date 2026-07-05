@@ -73,7 +73,7 @@ jobs:
         run: cargo test
 
   build:
-    name: Build (${{ matrix.os }})
+    name: Build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -93,3 +93,9 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+      # The lint job tests on Linux only; run the behavioural tests on every OS the
+      # release ships for (TTY/SIGPIPE handling and serial enumeration are the
+      # platform-sensitive parts).
+      - name: Test
+        run: cargo test

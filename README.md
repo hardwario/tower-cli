@@ -53,6 +53,24 @@ tower exec "/slow/op" --timeout 5000   # widen the per-command idle timeout (ms)
 tower logs --no-reconnect         # exit when the link drops instead of retrying
 ```
 
+The interactive commands:
+
+```sh
+tower                             # bare: open the TUI console (same as `tower console`)
+tower console                     # full-screen TUI: logs + events + shell in one view
+tower console --reset             # NRST-pulse the device on connect to see it boot
+tower shell                       # line-based interactive shell (commands start with /)
+tower shell --reset --timeout 3000
+tower complete "/sys"             # ask the target to complete a partial command line
+```
+
+And for transport debugging:
+
+```sh
+tower monitor                     # dump decoded frames as they arrive
+tower monitor --hex               # dump every raw received byte as hex
+```
+
 Colors default to **auto**: on when stdout is a terminal and `NO_COLOR` is unset,
 off when piped or redirected. The first device open is always fatal (a bad `--device`
 exits non-zero rather than retrying); reconnection only kicks in after a successful
@@ -69,10 +87,16 @@ the cause of a failure:
 | Code | Meaning |
 |------|---------|
 | `0`  | success |
-| `1`  | tool error (I/O, bad file, encode/decode, protocol-version mismatch) |
+| `1`  | tool error (I/O, bad file, encode/decode, truncated/incomplete device response) |
 | `2`  | usage error (bad arguments — emitted by clap) |
-| `124`| device command timed out (no or incomplete response) |
+| `124`| device command timed out (no response at all) |
+| `125`| protocol-version mismatch (device speaks a different `tower-protocol` tag — rebuild/re-pin) |
 | `1..=123` | `exec` only: the device-reported shell result (clamped into this range) |
+
+A response that arrives but is missing chunks exits `1`, not `124` — the device *did*
+answer, the output just can't be trusted. `125` is deliberately distinct so CI can
+detect the lockstep failure mode (stale `tower` binary vs. freshly flashed firmware)
+instead of misreading it as a timeout.
 
 ## Flashing firmware
 
@@ -101,3 +125,7 @@ Requires a Rust toolchain. On Linux the `serialport` dependency needs libudev:
 sudo apt-get install -y libudev-dev pkg-config   # Debian/Ubuntu
 cargo build --release                            # binary at target/release/tower
 ```
+
+## License
+
+MIT © 2026 HARDWARIO a.s.

@@ -45,7 +45,7 @@ use session::{Readiness, await_ready, read_response, request_completions};
 //   0    ok
 //   1    tool error (I/O, bad file, encode/decode)
 //   2    usage error (bad args — emitted by clap itself)
-//   124  device command timed out (no/incomplete response)
+//   124  device command timed out (no response at all; a truncated response is 1)
 //   125  protocol-version mismatch (device speaks a different tower-protocol tag)
 //
 // So a device `result` can't be confused with the reserved codes, `exec` clamps a

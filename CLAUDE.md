@@ -6,8 +6,9 @@ shell / TUI) and flashes/erases/resets over the UART bootloader (via the `jolt` 
 ## Shared wire protocol (`tower-protocol`) — keep it in lockstep
 
 The wire format lives in a **separate repo**, github.com/hardwario/tower-protocol, pinned here by
-git tag in `Cargo.toml`. The firmware (`tower-firmware`) pins the **same tag** — the two MUST move
-together, because postcard isn't self-describing (mismatched versions silently mis-decode).
+git tag in `Cargo.toml`. The firmware (`tower-firmware`, in **two** manifests) and the HIL bench
+harness (`tower-hil`) pin the **same tag** — all three consumers MUST move together, because
+postcard isn't self-describing (mismatched versions silently mis-decode).
 
 **To bump tower-protocol** (after a change is released there — see that repo's `CLAUDE.md`):
 

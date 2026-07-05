@@ -58,14 +58,15 @@ struct App {
     cmd_id: u16,
     req_id: u16,
     seq: u16,
-    resp_buf: String, // accumulates a chunked shell response until `last`
-    /// The `cmd_id` of the command whose `ShellResponse` we're currently reassembling.
-    /// Chunks for any other `cmd_id` are dropped (a stale/overlapping response must not
-    /// bleed into the current one). Cleared when the response completes or the port reopens.
-    pending_cmd: Option<u16>,
-    /// Expected `chunk` index of the next `ShellResponse` frame for `pending_cmd`; a gap
-    /// means a middle chunk was CRC-dropped, so the reassembled text is truncated.
-    next_chunk: u16,
+    /// In-flight commands, oldest first (the device's shell serializes, so responses arrive
+    /// in send order and always match the FRONT entry). A queue — not a single slot — so a
+    /// slow response never blocks typing/sending the next command: its lines simply keep
+    /// landing in the scrollback, right above the prompt, whenever they arrive.
+    pending: VecDeque<PendingCmd>,
+    /// The last scrollback line is an incomplete (no trailing newline yet) piece of the
+    /// front in-flight response; the next chunk continues it in place. Cleared by an echo
+    /// (a new command visually closes the line) and by completion/truncation.
+    resp_partial: bool,
     pending_req: Option<u16>,
     hint: String, // transient completion / status hint
     /// Whether we've already warned about a protocol-version mismatch (warn once per session).
@@ -90,7 +91,19 @@ struct App {
     /// EEPROM compaction can hold the chip ~5 s — docs/storage.md in tower-firmware) reads as
     /// progress, not a dead UI. Past the CLI's 8 s Hello ceiling it escalates to a warning.
     boot_wait: Option<Instant>,
+    /// High-water mark of hint rows ever rendered under the prompt — once TAB completion
+    /// allocates rows they STAY allocated (blank when no hint), so the prompt never jumps
+    /// up and down as hints come and go. Reset by <Shift-F8>.
+    hint_rows_reserved: u16,
     quit: bool,
+}
+
+/// One in-flight shell command awaiting its (possibly multi-chunk) response.
+struct PendingCmd {
+    cmd_id: u16,
+    /// Expected `chunk` index of the next `ShellResponse` frame; a gap means a middle chunk
+    /// was CRC-dropped, so the streamed output is truncated.
+    next_chunk: u16,
 }
 
 impl App {
@@ -113,9 +126,8 @@ impl App {
             cmd_id: 1,
             req_id: 1,
             seq: 0,
-            resp_buf: String::new(),
-            pending_cmd: None,
-            next_chunk: 0,
+            pending: VecDeque::new(),
+            resp_partial: false,
             pending_req: None,
             hint: String::new(),
             warned_mismatch: false,
@@ -127,6 +139,7 @@ impl App {
             last_open_error: None,
             last_open_attempt: Instant::now() - Duration::from_secs(10),
             boot_wait: None,
+            hint_rows_reserved: 0,
             quit: false,
         }
     }
@@ -160,6 +173,28 @@ fn push_event(app: &mut App, item: String) {
     }
 }
 
+/// Stream a response chunk's text into the shell scrollback line by line, continuing the
+/// in-flight partial line in place when the previous chunk ended mid-line. A trailing piece
+/// without a newline stays open (`resp_partial`) for the next chunk to extend.
+fn append_response_text(app: &mut App, text: &str) {
+    let mut cur = if app.resp_partial {
+        app.responses.pop_back().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    app.resp_partial = false;
+    let mut pieces = text.split('\n').peekable();
+    while let Some(piece) = pieces.next() {
+        cur.push_str(piece.trim_end_matches('\r'));
+        if pieces.peek().is_some() {
+            push_cap(&mut app.responses, core::mem::take(&mut cur));
+        } else if !cur.is_empty() {
+            push_cap(&mut app.responses, core::mem::take(&mut cur));
+            app.resp_partial = true;
+        }
+    }
+}
+
 pub fn run(port: String, reset: bool) -> Result<()> {
     // The FIRST open is fatal — same contract as the streaming commands: a bad `--device`
     // (typo, EBUSY, EACCES) must exit 1 with the real OS error, not silently spin in the
@@ -181,7 +216,7 @@ pub fn run(port: String, reset: bool) -> Result<()> {
 fn run_loop(terminal: &mut DefaultTerminal, mut app: App) -> Result<()> {
     while !app.quit {
         ensure_connected(&mut app);
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(Duration::from_millis(33))?
             && let Event::Key(key) = event::read()?
@@ -211,10 +246,10 @@ fn ensure_connected(app: &mut App) {
             app.sp = Some(sp);
             app.last_open_error = None;
             app.dec.reset();
-            // Drop any half-reassembled response from the previous connection: its remaining
+            // Drop any in-flight commands from the previous connection: their remaining
             // chunks will never arrive, and the new session restarts `cmd_id`/`chunk` at 1/0.
-            app.resp_buf.clear();
-            app.pending_cmd = None;
+            app.pending.clear();
+            app.resp_partial = false;
             app.pending_req = None;
         }
         Err(e) => app.last_open_error = Some(format!("{e:#}")),
@@ -364,32 +399,33 @@ fn handle_frame(app: &mut App, inner: &[u8]) {
         // Reassemble chunks (`chunk`/`last`) into one response before splitting it into lines,
         // so a chunk boundary mid-line doesn't fragment the display.
         MsgType::ShellResponse => match postcard::from_bytes::<ShellResponse>(payload) {
-            // Only reassemble chunks for the command we're currently awaiting — a stale or
-            // overlapping response (different cmd_id) must not bleed into this one.
-            Ok(r) if app.pending_cmd == Some(r.cmd_id) => {
+            // Chunks stream into the scrollback AS THEY ARRIVE (no wait for `last`), matched
+            // against the OLDEST in-flight command — the device's shell serializes, so
+            // responses complete in send order. A stale/unknown cmd_id is ignored.
+            Ok(r) if app.pending.front().map(|p| p.cmd_id) == Some(r.cmd_id) => {
+                let expected = app.pending.front().map(|p| p.next_chunk).unwrap_or(0);
                 // A `chunk` gap means a middle chunk was CRC-dropped (the decoder silently
-                // discards corrupt frames): flag the truncation instead of emitting a
-                // seemingly-complete response.
-                if r.chunk != app.next_chunk {
+                // discards corrupt frames): flag the truncation in place.
+                if r.chunk != expected {
+                    app.resp_partial = false;
                     push_cap(
                         &mut app.responses,
                         format!(
                             "[tower] response chunk dropped (expected #{}, got #{}) — output truncated",
-                            app.next_chunk, r.chunk
+                            expected, r.chunk
                         ),
                     );
                 }
-                app.next_chunk = r.chunk.wrapping_add(1);
-                app.resp_buf.push_str(r.text);
+                if let Some(front) = app.pending.front_mut() {
+                    front.next_chunk = r.chunk.wrapping_add(1);
+                }
+                append_response_text(app, r.text);
                 if r.last {
-                    for line in app.resp_buf.lines() {
-                        push_cap(&mut app.responses, line.to_string());
-                    }
+                    app.resp_partial = false;
                     if r.result != 0 {
                         push_cap(&mut app.responses, format!("[result {}]", r.result));
                     }
-                    app.resp_buf.clear();
-                    app.pending_cmd = None;
+                    app.pending.pop_front();
                 }
             }
             Ok(_) => {} // a response for a different cmd_id — ignore
@@ -473,11 +509,12 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         KeyCode::F(8) => {
             if mods.contains(KeyModifiers::SHIFT) {
-                // Shift-F8: clear every text area at once.
+                // Shift-F8: clear every text area at once (and release the hint rows).
                 app.logs.clear();
                 app.events.clear();
                 app.responses.clear();
                 app.scroll = [0; 3];
+                app.hint_rows_reserved = 0;
             } else {
                 match app.focus {
                     Pane::Logs => app.logs.clear(),
@@ -693,12 +730,19 @@ fn send_command(app: &mut App) {
         return;
     }
     app.cmd_id = app.cmd_id.wrapping_add(1);
+    // The echo closes any in-flight partial line; a late response continues on a fresh line
+    // under this echo — right above the prompt, in arrival order.
+    app.resp_partial = false;
     push_cap(&mut app.responses, format!("> {line}"));
-    app.resp_buf.clear(); // discard any incomplete prior response
-    // Track this command so `handle_frame` only reassembles chunks tagged with *its*
-    // cmd_id (a late chunk from a prior command must not bleed in), starting at chunk 0.
-    app.pending_cmd = Some(cmd_id);
-    app.next_chunk = 0;
+    // Queue (don't replace): a slow response must not block the next command. Bounded so a
+    // dead device can't grow it without limit.
+    if app.pending.len() >= 8 {
+        app.pending.pop_front();
+    }
+    app.pending.push_back(PendingCmd {
+        cmd_id,
+        next_chunk: 0,
+    });
     if app.history.last().map(|h| h.as_str()) != Some(line.as_str()) {
         app.history.push(line);
     }
@@ -758,7 +802,7 @@ fn header_diagnostics(app: &App) -> Option<String> {
     Some(format!("  ✖ {}", parts.join(" · ")))
 }
 
-fn ui(f: &mut ratatui::Frame, app: &App) {
+fn ui(f: &mut ratatui::Frame, app: &mut App) {
     let area = f.area();
     let bar = Style::new().bg(Color::Gray).fg(Color::Black);
 
@@ -871,7 +915,7 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     }
 }
 
-fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
+fn render_split(f: &mut ratatui::Frame, app: &mut App, body: Rect) {
     let cols =
         Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(body);
     let left = Layout::vertical([Constraint::Percentage(25), Constraint::Min(0)]).split(cols[0]);
@@ -898,7 +942,7 @@ fn render_split(f: &mut ratatui::Frame, app: &App, body: Rect) {
     );
 }
 
-fn render_zoom(f: &mut ratatui::Frame, app: &App, body: Rect) {
+fn render_zoom(f: &mut ratatui::Frame, app: &mut App, body: Rect) {
     let plain = |s: &String| Line::raw(s.clone());
     match app.focus {
         Pane::Logs => {
@@ -996,7 +1040,7 @@ fn render_text_pane<T>(
     f.render_widget(p, area);
 }
 
-fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &App) {
+fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Pane::Shell;
     let style = if focused {
         Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -1013,14 +1057,17 @@ fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &App) {
     }
 
     // Bottom-up allocation, SSH-style: the prompt is always the last row (plus hint rows
-    // right under it while completions/status are showing); everything above is scrollback.
-    let hint_rows: u16 = if app.hint.is_empty() {
+    // right under it); everything above is scrollback. Hint rows are a sticky HIGH-WATER
+    // mark: once TAB completion needs them they stay allocated (blank when no hint), so
+    // the prompt doesn't jump up and down as hints come and go. <Shift-F8> resets it.
+    let needed: u16 = if app.hint.is_empty() {
         0
     } else {
         let w = inner.width.max(1) as usize;
         (app.hint.chars().count().div_ceil(w) as u16).min(3)
     };
-    let hint_rows = hint_rows.min(inner.height.saturating_sub(1));
+    app.hint_rows_reserved = app.hint_rows_reserved.max(needed);
+    let hint_rows = app.hint_rows_reserved.min(inner.height.saturating_sub(1));
     let rows = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(1),
@@ -1250,13 +1297,13 @@ mod tests {
 
     /// Render `ui()` into an 80x24 test terminal and return the whole screen as text (rows
     /// joined by newlines), trailing spaces trimmed — enough to assert on visible content.
-    fn render_to_text(app: &App) -> String {
+    fn render_to_text(app: &mut App) -> String {
         render_to_text_sized(app, 80, 24)
     }
 
     /// Like [`render_to_text`] but at an explicit size — some assertions (the footer hint)
     /// need a wide terminal so the right-aligned clock doesn't overwrite the region.
-    fn render_to_text_sized(app: &App, w: u16, h: u16) -> String {
+    fn render_to_text_sized(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| ui(f, app)).unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -1274,8 +1321,8 @@ mod tests {
 
     #[test]
     fn ui_disconnected_shows_reconnecting() {
-        let app = test_app(); // no sp → disconnected
-        let text = render_to_text(&app);
+        let mut app = test_app(); // no sp → disconnected
+        let text = render_to_text(&mut app);
         assert!(text.contains("HARDWARIO TOWER Console"));
         assert!(text.contains("reconnecting"));
         assert!(text.contains("/dev/mock"));
@@ -1292,7 +1339,7 @@ mod tests {
         );
         push_cap(&mut app.events, "sensor temp=21".to_string());
         push_cap(&mut app.responses, "> /help".to_string());
-        let text = render_to_text(&app);
+        let text = render_to_text(&mut app);
         assert!(text.contains("Device Logs"));
         assert!(text.contains("Device Events"));
         assert!(text.contains("Interactive Shell"));
@@ -1308,7 +1355,7 @@ mod tests {
             &mut app.logs,
             ("zoomed log line".to_string(), String::new(), Color::Reset),
         );
-        let text = render_to_text(&app);
+        let text = render_to_text(&mut app);
         assert!(text.contains("zoomed log line"));
         // In zoom, the events/responses pane borders aren't drawn.
         assert!(!text.contains("Device Events"));
@@ -1345,8 +1392,8 @@ mod tests {
 
     #[test]
     fn ui_empty_input_shows_placeholder() {
-        let app = test_app();
-        let text = render_to_text_sized(&app, 140, 24);
+        let mut app = test_app();
+        let text = render_to_text_sized(&mut app, 140, 24);
         assert!(text.contains("Enter your command here"));
     }
 
@@ -1356,7 +1403,7 @@ mod tests {
         app.paused = true;
         app.hint = "system  radio  gpio".to_string();
         // Wide terminal so nothing truncates the hint line inside the command pane.
-        let text = render_to_text_sized(&app, 140, 24);
+        let text = render_to_text_sized(&mut app, 140, 24);
         assert!(text.contains("<F5> Pause"));
         // The hint renders INSIDE the Shell Command pane (second inner line), not the footer.
         assert!(text.contains("system  radio  gpio"));
@@ -1380,7 +1427,7 @@ mod tests {
             &mut app.logs,
             ("NEWEST-MARKER".to_string(), String::new(), Color::Reset),
         );
-        let text = render_to_text(&app);
+        let text = render_to_text(&mut app);
         assert!(
             text.contains("NEWEST-MARKER"),
             "the most recent line must stay visible even when earlier lines wrap"
@@ -1531,31 +1578,76 @@ mod tests {
     #[test]
     fn handle_frame_ignores_wrong_cmd_id() {
         let mut app = test_app();
-        app.pending_cmd = Some(5);
-        app.next_chunk = 0;
+        app.pending.push_back(PendingCmd {
+            cmd_id: 5,
+            next_chunk: 0,
+        });
         // A response for a different command must not populate this one (C18).
         handle_frame(&mut app, &resp_frame(9, 0, true, "stale"));
         assert!(app.responses.is_empty());
-        assert!(app.resp_buf.is_empty());
+        assert!(!app.pending.is_empty(), "the real command is still awaited");
     }
 
     #[test]
     fn handle_frame_reassembles_matching_cmd_id() {
         let mut app = test_app();
-        app.pending_cmd = Some(5);
-        app.next_chunk = 0;
+        app.pending.push_back(PendingCmd {
+            cmd_id: 5,
+            next_chunk: 0,
+        });
         handle_frame(&mut app, &resp_frame(5, 0, false, "line one\n"));
+        // Chunks stream in as they arrive — line one is visible BEFORE `last`.
+        assert_eq!(app.responses.back().unwrap(), "line one");
         handle_frame(&mut app, &resp_frame(5, 1, true, "line two"));
         let joined: Vec<String> = app.responses.iter().cloned().collect();
         assert_eq!(joined, vec!["line one".to_string(), "line two".to_string()]);
-        assert_eq!(app.pending_cmd, None); // cleared on `last`
+        assert!(app.pending.is_empty()); // cleared on `last`
+    }
+
+    #[test]
+    fn slow_response_lands_under_the_newer_echo() {
+        // SSH flow: cmd A is sent, then cmd B is typed before A's response arrives. A's
+        // (and then B's) lines land in arrival order right above the prompt — nothing
+        // blocks, nothing is dropped.
+        let mut app = test_app();
+        app.pending.push_back(PendingCmd {
+            cmd_id: 1,
+            next_chunk: 0,
+        });
+        push_cap(&mut app.responses, "> first".to_string());
+        push_cap(&mut app.responses, "> second".to_string()); // typed before A answered
+        app.pending.push_back(PendingCmd {
+            cmd_id: 2,
+            next_chunk: 0,
+        });
+        handle_frame(&mut app, &resp_frame(1, 0, true, "answer A"));
+        handle_frame(&mut app, &resp_frame(2, 0, true, "answer B"));
+        let joined: Vec<String> = app.responses.iter().cloned().collect();
+        assert_eq!(joined, vec!["> first", "> second", "answer A", "answer B"]);
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn partial_chunk_line_is_continued_in_place() {
+        let mut app = test_app();
+        app.pending.push_back(PendingCmd {
+            cmd_id: 3,
+            next_chunk: 0,
+        });
+        handle_frame(&mut app, &resp_frame(3, 0, false, "hello "));
+        assert_eq!(app.responses.back().unwrap(), "hello ");
+        handle_frame(&mut app, &resp_frame(3, 1, true, "world"));
+        assert_eq!(app.responses.back().unwrap(), "hello world");
+        assert_eq!(app.responses.len(), 1);
     }
 
     #[test]
     fn handle_frame_flags_chunk_gap() {
         let mut app = test_app();
-        app.pending_cmd = Some(2);
-        app.next_chunk = 0;
+        app.pending.push_back(PendingCmd {
+            cmd_id: 2,
+            next_chunk: 0,
+        });
         handle_frame(&mut app, &resp_frame(2, 0, false, "a"));
         handle_frame(&mut app, &resp_frame(2, 2, true, "c")); // chunk 1 missing → gap (C19)
         let joined: String = app.responses.iter().cloned().collect::<Vec<_>>().join("\n");
@@ -1631,7 +1723,7 @@ mod tests {
         app.decode_failures = 37;
         app.mismatch_got = Some(2);
         app.seq_gaps = 4;
-        let text = render_to_text_sized(&app, 140, 24);
+        let text = render_to_text_sized(&mut app, 140, 24);
         assert!(text.contains("37 bad frames"));
         assert!(text.contains("(v2?)"));
         assert!(text.contains("4 seq gaps"));
@@ -1641,7 +1733,7 @@ mod tests {
     fn ui_header_shows_reconnect_error() {
         let mut app = test_app(); // disconnected (sp = None)
         app.last_open_error = Some("Device or resource busy".to_string());
-        let text = render_to_text_sized(&app, 140, 24);
+        let text = render_to_text_sized(&mut app, 140, 24);
         assert!(text.contains("reconnecting"));
         assert!(text.contains("Device or resource busy"));
     }
@@ -1657,7 +1749,7 @@ mod tests {
         app.cursor = app.input.len();
         send_command(&mut app);
         assert_eq!(app.input, "/system radio");
-        assert_eq!(app.pending_cmd, None);
+        assert!(app.pending.is_empty());
         assert!(app.responses.is_empty());
         assert_eq!(app.cmd_id, 1);
         assert!(!app.hint.is_empty());

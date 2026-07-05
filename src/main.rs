@@ -32,7 +32,9 @@ use port::{devices, open_console, pick_port};
 use render::{
     ColorMode, OutputMode, View, hexline, read_loop, resolve_color, warn_protocol_mismatch,
 };
-use session::{Readiness, await_ready, read_response, request_completions};
+use session::{
+    CompletionOutcome, ReadOutcome, Readiness, await_ready, read_response, request_completions,
+};
 
 // ---- exit-code contract ---------------------------------------------------
 //
@@ -259,7 +261,7 @@ fn run(cli: Cli) -> Result<u8> {
             reset,
             delay,
             timeout,
-        } => shell(cli.port, reset, delay, Duration::from_millis(timeout)).map(|()| EXIT_OK),
+        } => shell(cli.port, reset, delay, Duration::from_millis(timeout)),
         Cmd::Exec {
             line,
             reset,
@@ -267,7 +269,7 @@ fn run(cli: Cli) -> Result<u8> {
             timeout,
         } => exec_cmd(cli.port, line, reset, delay, Duration::from_millis(timeout)),
         Cmd::Console { reset } => tui::run(pick_port(cli.port)?, reset).map(|()| EXIT_OK),
-        Cmd::Complete { line } => complete_cmd(cli.port, line).map(|()| EXIT_OK),
+        Cmd::Complete { line } => complete_cmd(cli.port, line),
         Cmd::Monitor { hex, reset } => monitor(cli.port, hex, reset).map(|()| EXIT_OK),
         Cmd::Flash {
             file,
@@ -318,10 +320,18 @@ fn stream(
         // auto-reconnect. Re-sending on each reconnect would double-poke the device and, worse,
         // skip the readiness wait (which only runs on `first`), racing the boot.
         if first && let Some(s) = &send {
-            // On a reset attach, wait for the device to come up before poking it.
+            // On a reset attach, wait for the device to come up before poking it — and
+            // surface a version mismatch immediately (the stream continues; render's
+            // decode-failure path keeps counting, but the banner names the cause up front).
             if reset {
                 let mut dec = FrameDecoder::new();
-                await_ready(&mut *sp, &mut dec, delay);
+                match await_ready(&mut *sp, &mut dec, delay) {
+                    Readiness::BadVersion(got) => warn_protocol_mismatch(got),
+                    Readiness::Hello(v) if v != tower_protocol::PROTOCOL_VERSION => {
+                        warn_protocol_mismatch(v)
+                    }
+                    Readiness::Hello(_) | Readiness::Timeout => {}
+                }
             }
             let _ = sp.write_all(s.as_bytes());
             let _ = sp.flush();
@@ -381,7 +391,7 @@ impl Completer for ShellHelper {
             req_id,
             Duration::from_millis(800),
         ) {
-            Some(r) => {
+            CompletionOutcome::Completions(r) => {
                 let pairs = r
                     .candidates
                     .into_iter()
@@ -400,7 +410,9 @@ impl Completer for ShellHelper {
                     .collect();
                 Ok((r.token_start as usize, pairs))
             }
-            None => Ok((pos, Vec::new())),
+            // Timeout (mismatch or not): offer no candidates. The per-command path
+            // reports a lockstep mismatch loudly; TAB shouldn't spam mid-edit.
+            CompletionOutcome::Timeout { .. } => Ok((pos, Vec::new())),
         }
     }
 }
@@ -412,15 +424,30 @@ impl Highlighter for ShellHelper {}
 impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
 
-fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duration) -> Result<()> {
+fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duration) -> Result<u8> {
     let port = pick_port(port)?;
     let mut sp = open_console(&port, reset)?;
     eprintln!("[tower] shell on {port} — TAB completes; commands start with '/'; 'exit' to quit");
 
     let mut dec = FrameDecoder::new();
     if reset {
-        // Don't drop into the prompt until the freshly reset device can answer.
-        await_ready(&mut *sp, &mut dec, delay);
+        // Don't drop into the prompt until the freshly reset device can answer — and refuse
+        // to open it at all on a protocol mismatch (same rule as `exec`): every command
+        // would otherwise just time out mute, which is exactly how the stale-binary
+        // lockstep incident presented.
+        let mismatch = match await_ready(&mut *sp, &mut dec, delay) {
+            Readiness::BadVersion(got) => Some(got),
+            Readiness::Hello(v) if v != tower_protocol::PROTOCOL_VERSION => Some(v),
+            Readiness::Hello(_) | Readiness::Timeout => None,
+        };
+        if let Some(v) = mismatch {
+            warn_protocol_mismatch(v);
+            eprintln!(
+                "[tower] protocol version mismatch (device v{v}, tower v{}) — refusing to open the shell; rebuild/repin against the same tower-protocol tag",
+                tower_protocol::PROTOCOL_VERSION
+            );
+            return Ok(EXIT_PROTOCOL_MISMATCH);
+        }
     }
     let conn = Rc::new(RefCell::new(Conn { sp, dec, req_id: 0 }));
     let mut rl: Editor<ShellHelper, rustyline::history::DefaultHistory> = Editor::new()?;
@@ -428,6 +455,8 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duratio
 
     let mut cmd_id: u16 = 1;
     let mut seq: u16 = 0;
+    // The full remediation banner once per session; later mismatches get the short line.
+    let mut warned_mismatch = false;
     loop {
         match rl.readline("> ") {
             Ok(input) => {
@@ -465,7 +494,7 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duratio
                 sp.write_all(&buf[..n])?;
                 sp.flush()?;
                 match read_response(&mut **sp, dec, cmd_id, timeout) {
-                    Some(r) => {
+                    ReadOutcome::Response(r) => {
                         print!("{}", r.text);
                         if !r.text.is_empty() && !r.text.ends_with('\n') {
                             println!();
@@ -474,7 +503,24 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duratio
                             eprintln!("[result {}]", r.result);
                         }
                     }
-                    None => eprintln!("[tower] no response (timeout)"),
+                    // The device answered — with frames from a different tower-protocol
+                    // tag. Without this, the interactive shell was the one consumer that
+                    // stayed mute on the mismatch the ecosystem got burned by.
+                    ReadOutcome::Timeout {
+                        bad_version: Some(v),
+                    } => {
+                        if !warned_mismatch {
+                            warn_protocol_mismatch(v);
+                            warned_mismatch = true;
+                        }
+                        eprintln!(
+                            "[tower] no response — device speaks protocol v{v}, tower speaks v{} (lockstep mismatch)",
+                            tower_protocol::PROTOCOL_VERSION
+                        );
+                    }
+                    ReadOutcome::Timeout { bad_version: None } => {
+                        eprintln!("[tower] no response (timeout)")
+                    }
                 }
                 cmd_id = cmd_id.wrapping_add(1);
             }
@@ -484,7 +530,7 @@ fn shell(port: Option<String>, reset: bool, delay: Option<u64>, timeout: Duratio
             Err(e) => return Err(anyhow::Error::new(e).context("readline")),
         }
     }
-    Ok(())
+    Ok(EXIT_OK)
 }
 
 /// A per-invocation `cmd_id` for the one-shot `exec`: the low 15 bits of the PID, never 0.
@@ -547,7 +593,7 @@ fn exec_cmd(
     sp.write_all(&buf[..n])?;
     sp.flush()?;
     match read_response(&mut *sp, &mut dec, cmd_id, timeout) {
-        Some(r) => {
+        ReadOutcome::Response(r) => {
             print!("{}", r.text);
             if !r.text.is_empty() && !r.text.ends_with('\n') {
                 println!();
@@ -566,14 +612,27 @@ fn exec_cmd(
             }
             Ok(EXIT_OK)
         }
-        None => {
+        // Frames arrived but every one was version-rejected: that's the lockstep failure
+        // (125), not a mute device (124) — even without --reset, where the Hello-based
+        // check above never ran.
+        ReadOutcome::Timeout {
+            bad_version: Some(v),
+        } => {
+            warn_protocol_mismatch(v);
+            eprintln!(
+                "[tower] no response — device speaks protocol v{v}, tower speaks v{} (lockstep mismatch)",
+                tower_protocol::PROTOCOL_VERSION
+            );
+            Ok(EXIT_PROTOCOL_MISMATCH)
+        }
+        ReadOutcome::Timeout { bad_version: None } => {
             eprintln!("[tower] no response (timeout)");
             Ok(EXIT_DEVICE_TIMEOUT)
         }
     }
 }
 
-fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
+fn complete_cmd(port: Option<String>, line: String) -> Result<u8> {
     let port = pick_port(port)?;
     // No --reset here (completion is a momentary query), but still establish the
     // run baseline so we don't query a device the bridge left held in reset.
@@ -588,7 +647,7 @@ fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
         1,
         Duration::from_millis(1500),
     ) {
-        Some(r) => {
+        CompletionOutcome::Completions(r) => {
             println!(
                 "token_start={} common_prefix={:?}{}",
                 r.token_start,
@@ -598,10 +657,24 @@ fn complete_cmd(port: Option<String>, line: String) -> Result<()> {
             for (text, kind) in &r.candidates {
                 println!("  {kind:?}  {text}");
             }
+            Ok(EXIT_OK)
         }
-        None => eprintln!("[tower] no completions (timeout)"),
+        // Same 125 rule as exec: version-rejected frames mean lockstep, not a dead link.
+        CompletionOutcome::Timeout {
+            bad_version: Some(v),
+        } => {
+            warn_protocol_mismatch(v);
+            eprintln!(
+                "[tower] no completions — device speaks protocol v{v}, tower speaks v{} (lockstep mismatch)",
+                tower_protocol::PROTOCOL_VERSION
+            );
+            Ok(EXIT_PROTOCOL_MISMATCH)
+        }
+        CompletionOutcome::Timeout { bad_version: None } => {
+            eprintln!("[tower] no completions (timeout)");
+            Ok(EXIT_OK)
+        }
     }
-    Ok(())
 }
 
 // ---- monitor (transport debugging) ----------------------------------------
@@ -1076,6 +1149,31 @@ mod tests {
         let mut sp = MockPort::new(bytes);
         let mut dec = FrameDecoder::new();
         assert!(read_response(&mut sp, &mut dec, 1, SHORT).is_none());
+    }
+
+    #[test]
+    fn read_response_timeout_carries_the_mismatched_version() {
+        // The device answers — but every frame is tagged with a different protocol version.
+        // The timeout must carry that version so exec/shell report lockstep (125), not a
+        // mute device (124): the exact stale-binary incident this ecosystem had.
+        let mut sp = MockPort::new(hello_wire_bad_version(1));
+        let mut dec = FrameDecoder::new();
+        match read_response(&mut sp, &mut dec, 1, SHORT) {
+            ReadOutcome::Timeout { bad_version } => assert_eq!(bad_version, Some(1)),
+            ReadOutcome::Response(_) => panic!("a version-rejected frame must not decode"),
+        }
+    }
+
+    #[test]
+    fn request_completions_timeout_carries_the_mismatched_version() {
+        let mut sp = MockPort::new(hello_wire_bad_version(1));
+        let mut dec = FrameDecoder::new();
+        match request_completions(&mut sp, &mut dec, "/s", 2, 1, SHORT) {
+            CompletionOutcome::Timeout { bad_version } => assert_eq!(bad_version, Some(1)),
+            CompletionOutcome::Completions(_) => {
+                panic!("a version-rejected frame must not decode")
+            }
+        }
     }
 
     // ---- Hello handshake ----

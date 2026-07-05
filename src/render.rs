@@ -218,6 +218,15 @@ pub(crate) fn render(inner: &[u8], mode: OutputMode, view: View, st: &mut Render
         Ok(t) => t,
         Err(e) => {
             st.decode_failures += 1;
+            // A header-level BadVersion IS the lockstep mismatch (it's rejected before any
+            // Hello payload could parse, so the Hello-based banner below would never fire) —
+            // escalate to the full remediation banner, once.
+            if let tower_protocol::Error::BadVersion { got } = e
+                && !st.warned_mismatch
+            {
+                warn_protocol_mismatch(got);
+                st.warned_mismatch = true;
+            }
             // A version-tagged codec error is the smoking gun for a tag mismatch; surface the
             // running count so a wall of them reads as one diagnosable cause, not noise. In
             // JSON mode make it a first-class NDJSON record (like device-side `Dropped`) so

@@ -121,6 +121,31 @@ pub(crate) struct Response {
     pub(crate) incomplete: bool,
 }
 
+/// The result of waiting for a shell response. The timeout variant carries the lockstep
+/// smoking gun: if frames DID arrive but every one was rejected at the header for its
+/// protocol version, the link isn't dead — the two ends speak different `tower-protocol`
+/// tags — and callers must say so (exit 125) instead of reporting a mute device (124).
+pub(crate) enum ReadOutcome {
+    Response(Response),
+    Timeout { bad_version: Option<u8> },
+}
+
+impl ReadOutcome {
+    /// Test convenience mirroring the previous `Option` API.
+    #[cfg(test)]
+    pub(crate) fn unwrap(self) -> Response {
+        match self {
+            ReadOutcome::Response(r) => r,
+            ReadOutcome::Timeout { .. } => panic!("read_response timed out"),
+        }
+    }
+    /// Test convenience mirroring the previous `Option` API ("timed out?").
+    #[cfg(test)]
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, ReadOutcome::Timeout { .. })
+    }
+}
+
 /// Read frames until the `ShellResponse` for `cmd_id` completes (`last`), or the idle
 /// `timeout` elapses. Non-matching frames (logs/events, other `cmd_id`s) are ignored.
 ///
@@ -130,55 +155,70 @@ pub(crate) struct Response {
 /// CRC-dropped (the frame decoder silently discards corrupt frames), which would otherwise
 /// yield silently-truncated output with result 0 — so we flag it `incomplete` instead.
 ///
-/// Returns `None` only on a hard read error or if no matching chunk ever arrives before the
-/// idle timeout. A response that starts but never reaches `last` before the idle timeout also
-/// returns `None` (treated as a timeout by callers).
+/// Times out only on a hard read error or if no matching chunk ever arrives before the
+/// idle deadline; version-rejected frames seen while waiting are reported in the
+/// [`ReadOutcome::Timeout`] so the caller can diagnose a lockstep mismatch.
 pub(crate) fn read_response(
     sp: &mut (impl Transport + ?Sized),
     dec: &mut FrameDecoder,
     cmd_id: u16,
     timeout: Duration,
-) -> Option<Response> {
+) -> ReadOutcome {
     let mut deadline = Instant::now() + timeout;
     let mut text = String::new();
     let mut next_chunk: u16 = 0; // expected `chunk` index of the next matching frame
     let mut incomplete = false;
+    let mut bad_version: Option<u8> = None;
     let mut buf = [0u8; 256];
     while Instant::now() < deadline {
         let nread = match sp.read(&mut buf) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
-            Err(_) => return None,
+            Err(_) => return ReadOutcome::Timeout { bad_version },
         };
         for &b in &buf[..nread] {
-            if let Some(inner) = dec.push(b)
-                && let Ok((MsgType::ShellResponse, _, payload)) = decode_frame(inner)
-                && let Ok(r) = postcard::from_bytes::<ShellResponse>(payload)
-                && r.cmd_id == cmd_id
-            {
-                // A matching chunk: extend the idle window.
-                deadline = Instant::now() + timeout;
-                if r.chunk != next_chunk {
-                    // A middle chunk was dropped (or reordered) — the output is truncated.
-                    eprintln!(
-                        "[tower] response chunk dropped (expected #{next_chunk}, got #{}) — output truncated",
-                        r.chunk
-                    );
-                    incomplete = true;
+            let Some(inner) = dec.push(b) else { continue };
+            let (mt, _, payload) = match decode_frame(inner) {
+                Ok(t) => t,
+                Err(Error::BadVersion { got }) => {
+                    // The device IS talking — its frames just carry a different protocol
+                    // version. Remember it so a "timeout" can be diagnosed as lockstep.
+                    bad_version = Some(got);
+                    continue;
                 }
-                next_chunk = r.chunk.wrapping_add(1);
-                text.push_str(r.text);
-                if r.last {
-                    return Some(Response {
-                        result: r.result,
-                        text,
-                        incomplete,
-                    });
-                }
+                Err(_) => continue,
+            };
+            if mt != MsgType::ShellResponse {
+                continue;
+            }
+            let Ok(r) = postcard::from_bytes::<ShellResponse>(payload) else {
+                continue;
+            };
+            if r.cmd_id != cmd_id {
+                continue;
+            }
+            // A matching chunk: extend the idle window.
+            deadline = Instant::now() + timeout;
+            if r.chunk != next_chunk {
+                // A middle chunk was dropped (or reordered) — the output is truncated.
+                eprintln!(
+                    "[tower] response chunk dropped (expected #{next_chunk}, got #{}) — output truncated",
+                    r.chunk
+                );
+                incomplete = true;
+            }
+            next_chunk = r.chunk.wrapping_add(1);
+            text.push_str(r.text);
+            if r.last {
+                return ReadOutcome::Response(Response {
+                    result: r.result,
+                    text,
+                    incomplete,
+                });
             }
         }
     }
-    None
+    ReadOutcome::Timeout { bad_version }
 }
 
 // ---- completion (target-authoritative) ------------------------------------
@@ -191,8 +231,31 @@ pub(crate) struct CompletionResult {
     pub(crate) more: bool,
 }
 
+/// The result of a completion request — same tri-state rationale as [`ReadOutcome`].
+pub(crate) enum CompletionOutcome {
+    Completions(CompletionResult),
+    Timeout { bad_version: Option<u8> },
+}
+
+impl CompletionOutcome {
+    /// Test convenience mirroring the previous `Option` API.
+    #[cfg(test)]
+    pub(crate) fn unwrap(self) -> CompletionResult {
+        match self {
+            CompletionOutcome::Completions(c) => c,
+            CompletionOutcome::Timeout { .. } => panic!("request_completions timed out"),
+        }
+    }
+    /// Test convenience mirroring the previous `Option` API ("timed out?").
+    #[cfg(test)]
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, CompletionOutcome::Timeout { .. })
+    }
+}
+
 /// Send a `ShellComplete` and wait for the matching `ShellCompletions`. Shared by the
-/// `complete` command and the interactive TAB handler.
+/// `complete` command and the interactive TAB handler. Version-rejected frames seen while
+/// waiting are reported in the timeout variant (lockstep diagnosis, like [`read_response`]).
 pub(crate) fn request_completions(
     sp: &mut (impl Transport + ?Sized),
     dec: &mut FrameDecoder,
@@ -200,9 +263,10 @@ pub(crate) fn request_completions(
     cursor: u16,
     req_id: u16,
     timeout: Duration,
-) -> Option<CompletionResult> {
+) -> CompletionOutcome {
+    let mut bad_version: Option<u8> = None;
     let mut buf = [0u8; MAX_WIRE];
-    let n = encode_frame(
+    let Ok(n) = encode_frame(
         MsgType::ShellComplete,
         0,
         &ShellComplete {
@@ -211,10 +275,12 @@ pub(crate) fn request_completions(
             cursor,
         },
         &mut buf,
-    )
-    .ok()?;
-    sp.write_all(&buf[..n]).ok()?;
-    sp.flush().ok()?;
+    ) else {
+        return CompletionOutcome::Timeout { bad_version };
+    };
+    if sp.write_all(&buf[..n]).is_err() || sp.flush().is_err() {
+        return CompletionOutcome::Timeout { bad_version };
+    }
 
     let deadline = Instant::now() + timeout;
     let mut rbuf = [0u8; 256];
@@ -222,26 +288,38 @@ pub(crate) fn request_completions(
         let nread = match sp.read(&mut rbuf) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => 0,
-            Err(_) => return None,
+            Err(_) => return CompletionOutcome::Timeout { bad_version },
         };
         for &b in &rbuf[..nread] {
-            if let Some(inner) = dec.push(b)
-                && let Ok((MsgType::ShellCompletions, _, payload)) = decode_frame(inner)
-                && let Ok(c) = postcard::from_bytes::<ShellCompletions>(payload)
-                && c.req_id == req_id
-            {
-                return Some(CompletionResult {
-                    token_start: c.token_start,
-                    common_prefix: c.common_prefix.to_string(),
-                    candidates: c
-                        .candidates
-                        .iter()
-                        .map(|cd| (cd.text.to_string(), cd.kind))
-                        .collect(),
-                    more: c.more,
-                });
+            let Some(inner) = dec.push(b) else { continue };
+            let (mt, _, payload) = match decode_frame(inner) {
+                Ok(t) => t,
+                Err(Error::BadVersion { got }) => {
+                    bad_version = Some(got);
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            if mt != MsgType::ShellCompletions {
+                continue;
             }
+            let Ok(c) = postcard::from_bytes::<ShellCompletions>(payload) else {
+                continue;
+            };
+            if c.req_id != req_id {
+                continue;
+            }
+            return CompletionOutcome::Completions(CompletionResult {
+                token_start: c.token_start,
+                common_prefix: c.common_prefix.to_string(),
+                candidates: c
+                    .candidates
+                    .iter()
+                    .map(|cd| (cd.text.to_string(), cd.kind))
+                    .collect(),
+                more: c.more,
+            });
         }
     }
-    None
+    CompletionOutcome::Timeout { bad_version }
 }

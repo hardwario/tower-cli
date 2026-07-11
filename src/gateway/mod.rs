@@ -45,7 +45,7 @@ pub(crate) struct GatewayOpts {
     #[cfg(feature = "embedded-broker")]
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "mqtt")]
     pub broker: Option<Option<std::net::SocketAddr>>,
-    /// Connect to an existing MQTT broker at HOST[:PORT] instead of hosting one.
+    /// Connect to an existing MQTT broker at HOST or HOST:PORT instead of hosting one.
     #[arg(long, value_name = "HOST[:PORT]")]
     pub mqtt: Option<String>,
     /// External-broker username.

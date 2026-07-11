@@ -78,7 +78,7 @@ pub(crate) fn wait_for_hello(
     wait_for_hello_with(sp, dec, timeout, |_| {})
 }
 
-/// [`wait_for_hello`] with a progress callback, invoked with the elapsed wait roughly at the
+/// `wait_for_hello` with a progress callback, invoked with the elapsed wait roughly at the
 /// port's read-timeout cadence — the boot can legitimately take seconds (worst case a fallback
 /// EEPROM compaction ≈ 5 s), so interactive callers animate the wait instead of sitting mute.
 pub(crate) fn wait_for_hello_with(
@@ -131,7 +131,7 @@ pub(crate) fn await_ready(
     await_ready_with(sp, dec, delay, |_| {})
 }
 
-/// [`await_ready`] with a boot-wait progress callback (see [`wait_for_hello_with`]).
+/// `await_ready` with a boot-wait progress callback (see `wait_for_hello_with`).
 pub(crate) fn await_ready_with(
     sp: &mut (impl Transport + ?Sized),
     dec: &mut FrameDecoder,

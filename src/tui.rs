@@ -93,7 +93,7 @@ struct App {
     boot_wait: Option<Instant>,
     /// High-water mark of hint rows ever rendered under the prompt — once TAB completion
     /// allocates rows they STAY allocated (blank when no hint), so the prompt never jumps
-    /// up and down as hints come and go. Reset by <Shift-F8>.
+    /// up and down as hints come and go. Reset by `Shift-F8`.
     hint_rows_reserved: u16,
     quit: bool,
 }

@@ -57,16 +57,24 @@ fn status(opts: &MqttOpts, json: bool) -> Result<u8> {
         }
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
-        println!(
-            "gateway:  {} ({} {})",
-            status.gateway, status.firmware, status.firmware_version
-        );
-        println!(
-            "state:    {} (serial {} on {})",
-            status.state,
-            if status.serial_up { "up" } else { "DOWN" },
-            status.serial_port
-        );
+        if status.state == "offline" {
+            // The LWT fired: the broker only knows we're gone — the other fields
+            // are its defaults, not data. Say the one thing that's true.
+            println!(
+                "state:    offline (the gateway's last-will fired — the bridge process is gone)"
+            );
+        } else {
+            println!(
+                "gateway:  {} ({} {})",
+                status.gateway, status.firmware, status.firmware_version
+            );
+            println!(
+                "state:    {} (serial {} on {})",
+                status.state,
+                if status.serial_up { "up" } else { "DOWN" },
+                status.serial_port
+            );
+        }
         println!(
             "protocol: v{} · mqtt schema v{}",
             status.protocol, status.schema

@@ -10,8 +10,12 @@ use serde::{Deserialize, Serialize};
 /// Version of this topic/payload tree, carried in the retained `gateway/status`.
 pub(crate) const SCHEMA: u32 = 1;
 
-/// `gateway/status` (retained; the LWT publishes the same shape with `state:"offline"`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+/// `gateway/status` (retained). The LWT publishes only `{state:"offline", schema}` —
+/// the broker can't know the rest once we're gone — so every other field is
+/// `#[serde(default)]`: without that, `net status` could not even *parse* the one
+/// payload that means "gateway died", which is the state the command exists to report.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
 pub(crate) struct Status {
     /// `online` (serial + mqtt up) | `degraded` (serial down) | `offline` (LWT).
     pub state: String,

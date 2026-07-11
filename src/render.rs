@@ -35,7 +35,7 @@ pub(crate) enum ColorMode {
 }
 
 impl ColorMode {
-    /// Resolve to a concrete on/off, honoring the `NO_COLOR` convention (https://no-color.org)
+    /// Resolve to a concrete on/off, honoring the `NO_COLOR` convention (<https://no-color.org>)
     /// and TTY detection for `Auto`.
     fn enabled(self) -> bool {
         use std::io::IsTerminal;

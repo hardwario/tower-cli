@@ -48,7 +48,7 @@ The streaming commands render the framed link to stdout:
 tower logs                        # decoded logs + print! output
 tower logs --color never          # force plain output (--color auto|always|never)
 tower events                      # structured key=value events
-tower exec "/system/resource"     # run one shell command, print its reply, exit
+tower exec "/system/resource print"   # run one shell command, print its reply, exit
 tower exec "/slow/op" --timeout 5000   # widen the per-command idle timeout (ms)
 tower logs --no-reconnect         # exit when the link drops instead of retrying
 ```

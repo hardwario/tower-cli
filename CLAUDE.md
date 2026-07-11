@@ -1,7 +1,10 @@
 # tower-cli — working notes for Claude
 
 The `tower` host CLI: decodes the framed serial link from the TOWER firmware (logs / events /
-shell / TUI) and flashes/erases/resets over the UART bootloader (via the `jolt` engine).
+shell / TUI) and flashes/erases/resets over the UART bootloader (via the `jolt` engine). It is
+also the gateway/MQTT host — `tower gateway` bridges a Radio Dongle's network to MQTT (embedded
+`rumqttd` broker or external, TUI + `--service`), and `tower nodes` / `tower net` are the MQTT
+client commands (`src/gateway/`, `src/client/`).
 
 ## Shared wire protocol (`tower-protocol`) — keep it in lockstep
 

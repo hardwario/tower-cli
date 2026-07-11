@@ -17,7 +17,7 @@
 //! | `nodes/{id}/uplink`             | gw→ | no     | `UplinkDebug`                 |
 //! | `nodes/{id}/shell/req`          | →gw | no     | `ShellReq`                    |
 //! | `nodes/{id}/shell/rsp`          | gw→ | no     | `ShellRsp`                    |
-//! | `nodes/{id}/shell/pending`      | gw→ | yes    | `Pending`                     |
+//! | `nodes/{id}/shell/pending`      | gw→ | yes    | `[PendingEntry]` (queue mirror)|
 //! | `radio/rssi`                    | gw→ | no     | `RadioRssi`                   |
 //! | `radio/rx` / `radio/tx`         | gw→ | no     | `RadioRx` / `RadioTx`         |
 

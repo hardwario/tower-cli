@@ -79,6 +79,43 @@ attach, and `--no-reconnect` disables it entirely.
 The device is selected with `-d`/`--device` (auto-detected when exactly one USB serial
 device is present). List what's connected with `tower devices`.
 
+### Gateway & MQTT bridge
+
+With a Radio Dongle running the `radio_dongle_gateway` firmware, `tower gateway` bridges
+its radio network to MQTT — a full-screen TUI by default, or headless with `--service`. It
+hosts an embedded MQTT broker unless pointed at an external one:
+
+```sh
+tower gateway                       # TUI + embedded broker on 127.0.0.1:1883
+tower gateway --service             # headless: MQTT is the only interface, logs to stderr
+tower gateway --broker 0.0.0.0:1883 # embedded broker, bound to a given address
+tower gateway --mqtt host:1883      # use an existing broker instead of hosting one
+                                    #   (--mqtt-user / TOWER_MQTT_PASSWORD for auth)
+tower gateway --prefix tower/       # MQTT topic prefix (default tower/)
+tower gateway --reset               # NRST-pulse the dongle on attach (clears its RAM queue)
+```
+
+The MQTT topic tree (under `--prefix`) is the gateway's public API — the full table lives
+in [`src/gateway/topics.rs`](src/gateway/topics.rs).
+
+The **client** commands drive a running gateway over MQTT (they share `--mqtt`/`--prefix`;
+`<node>` is a `0xHHHHHHHH` id or a friendly name):
+
+```sh
+tower nodes list                                   # the gateway's registered nodes
+tower nodes show <node> [--keys]                   # one node (--keys reveals its AES key)
+tower nodes add --ota [--window 60] [--name N]     # pair over the air (node held in join mode)
+tower nodes add --port <SERIAL> [--name N]         # pair a node over its USB cable
+tower nodes rename <node> <name>
+tower nodes remove <node>
+tower nodes shell <node> "<line>" [--timeout MS] [--no-wait]   # remote shell, queued until wake
+tower nodes pending <node>                         # queued, not-yet-delivered commands
+tower nodes dequeue <node> <ref>                   # drop a queued command by ref
+tower net status                                   # gateway online/offline + stats summary
+```
+
+Role is enforced: `tower gateway` at a node, or `nodes add --port` at a gateway, exits `126`.
+
 ### Exit codes
 
 `tower` follows a small, stable exit-code contract so scripts and CI can branch on
@@ -89,8 +126,9 @@ the cause of a failure:
 | `0`  | success |
 | `1`  | tool error (I/O, bad file, encode/decode, truncated/incomplete device response) |
 | `2`  | usage error (bad arguments — emitted by clap) |
-| `124`| device command timed out (no response at all) |
+| `124`| device command timed out (no response at all — also: no gateway reply to an MQTT RPC) |
 | `125`| protocol-version mismatch (device speaks a different `tower-protocol` tag — rebuild/re-pin) |
+| `126`| wrong firmware role (`tower gateway`/`nodes add --port` pointed at the wrong kind of device) |
 | `1..=123` | `exec` only: the device-reported shell result (clamped into this range) |
 
 A response that arrives but is missing chunks exits `1`, not `124` — the device *did*

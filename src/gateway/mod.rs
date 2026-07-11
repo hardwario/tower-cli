@@ -84,6 +84,48 @@ fn split_host_port(s: &str) -> (String, u16) {
 /// A verified, open gateway attach — or the exit code refusing it.
 type Verified = std::result::Result<(Box<dyn serialport::SerialPort>, DeviceInfoOwned), u8>;
 
+/// The terminal decision from one `Describe` role probe, factored out of [`verify_gateway`]
+/// so the role gate is unit-testable without a serial port (the port open + boot-window
+/// retry loop stays in `verify_gateway`). `Accept` = a real gateway; `Reject(code)` =
+/// refuse the attach with that exit code; `Retry` = an inconclusive (mute) probe — the
+/// caller tries once more before giving up as a timeout.
+enum GateDecision {
+    Accept(DeviceInfoOwned),
+    Reject(u8),
+    Retry,
+}
+
+/// Map one `Describe` outcome onto the gateway-verification decision (see the exit-code
+/// contract in `main`): a non-gateway role or a refused probe is [`EXIT_WRONG_FIRMWARE`], a
+/// header version mismatch is [`EXIT_PROTOCOL_MISMATCH`], and a mute probe is retryable.
+/// Pure but for the operator-facing diagnostics it prints on a refusal.
+fn gate_describe(port: &str, outcome: DescribeOutcome) -> GateDecision {
+    match outcome {
+        DescribeOutcome::Info(info) => {
+            if info.role != DeviceRole::Gateway {
+                eprintln!(
+                    "[tower] {port} runs \"{}\" (role {:?}), not the gateway firmware — flash apps/radio_dongle_gateway first",
+                    info.firmware_name, info.role
+                );
+                GateDecision::Reject(EXIT_WRONG_FIRMWARE)
+            } else {
+                GateDecision::Accept(info)
+            }
+        }
+        DescribeOutcome::Refused(code) => {
+            eprintln!("[tower] {port}: device refused the role probe (code {code})");
+            GateDecision::Reject(EXIT_WRONG_FIRMWARE)
+        }
+        DescribeOutcome::Timeout {
+            bad_version: Some(got),
+        } => {
+            warn_protocol_mismatch(got);
+            GateDecision::Reject(EXIT_PROTOCOL_MISMATCH)
+        }
+        DescribeOutcome::Timeout { bad_version: None } => GateDecision::Retry,
+    }
+}
+
 /// The verified gateway attach: open + `Describe` + role gate. Shared with the TUI
 /// path so both fail before any screen takeover.
 pub(crate) fn verify_gateway(port: &str, reset: bool) -> Result<Verified> {
@@ -96,28 +138,13 @@ pub(crate) fn verify_gateway(port: &str, reset: bool) -> Result<Verified> {
     let mut dec = FrameDecoder::new();
     // Two attempts: the first can land in a boot burst / compaction stall.
     for attempt in 0..2 {
-        match describe(&mut *sp, &mut dec, 0x7000 + attempt, Duration::from_secs(4)) {
-            DescribeOutcome::Info(info) => {
-                if info.role != DeviceRole::Gateway {
-                    eprintln!(
-                        "[tower] {port} runs \"{}\" (role {:?}), not the gateway firmware — flash apps/radio_dongle_gateway first",
-                        info.firmware_name, info.role
-                    );
-                    return Ok(Err(EXIT_WRONG_FIRMWARE));
-                }
-                return Ok(Ok((sp, info)));
-            }
-            DescribeOutcome::Refused(code) => {
-                eprintln!("[tower] {port}: device refused the role probe (code {code})");
-                return Ok(Err(EXIT_WRONG_FIRMWARE));
-            }
-            DescribeOutcome::Timeout {
-                bad_version: Some(got),
-            } => {
-                warn_protocol_mismatch(got);
-                return Ok(Err(EXIT_PROTOCOL_MISMATCH));
-            }
-            DescribeOutcome::Timeout { bad_version: None } => {}
+        match gate_describe(
+            port,
+            describe(&mut *sp, &mut dec, 0x7000 + attempt, Duration::from_secs(4)),
+        ) {
+            GateDecision::Accept(info) => return Ok(Ok((sp, info))),
+            GateDecision::Reject(code) => return Ok(Err(code)),
+            GateDecision::Retry => {}
         }
     }
     eprintln!(
@@ -247,5 +274,184 @@ pub(crate) fn run(port: Option<String>, opts: GatewayOpts) -> Result<u8> {
         Ok(EXIT_OK)
     } else {
         tui::run(event_rx, input_tx, prefix, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+
+    use tower_protocol::mgmt::{DeviceInfo, MGMT_OK, MGMT_UNSUPPORTED};
+    use tower_protocol::msg::{Hello, MgmtResponse};
+    use tower_protocol::{MAX_WIRE, MsgType, encode_frame};
+
+    /// In-memory duplex port, same contract as the `MockPort`s in `mgmt.rs` / `main.rs`
+    /// tests: a drained read returns `TimedOut` exactly like a real serial port past its
+    /// read timeout, so `describe`'s read loop exercises its real timeout path.
+    struct Mock {
+        to_read: VecDeque<u8>,
+        written: Vec<u8>,
+    }
+    impl Mock {
+        fn new() -> Self {
+            Self {
+                to_read: VecDeque::new(),
+                written: Vec::new(),
+            }
+        }
+        fn feed(&mut self, bytes: &[u8]) {
+            self.to_read.extend(bytes.iter().copied());
+        }
+    }
+    impl Read for Mock {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.to_read.is_empty() {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            let n = buf.len().min(self.to_read.len());
+            for slot in buf.iter_mut().take(n) {
+                *slot = self.to_read.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+    }
+    impl Write for Mock {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A postcard `DeviceInfo` record for the given role (the `Describe` reply body).
+    fn device_info(role: DeviceRole) -> Vec<u8> {
+        postcard::to_stdvec(&DeviceInfo {
+            role,
+            radio_schema_version: 1,
+            net_id: 0xAB12,
+            band: 0,
+            channel: 0,
+            node_capacity: 32,
+            node_count: 0,
+            provisioned: true,
+            gw_id: 0xAB12,
+            firmware_name: "radio_push_button",
+        })
+        .unwrap()
+    }
+
+    /// A single-chunk `MgmtResponse` wire frame answering `req_id`.
+    fn mgmt_response(req_id: u16, result: u8, data: &[u8]) -> Vec<u8> {
+        let mut buf = [0u8; MAX_WIRE];
+        let n = encode_frame(
+            MsgType::MgmtResponse,
+            0,
+            &MgmtResponse {
+                req_id,
+                result,
+                chunk: 0,
+                last: true,
+                data,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        buf[..n].to_vec()
+    }
+
+    fn hello_frame() -> Vec<u8> {
+        let mut buf = [0u8; MAX_WIRE];
+        let n = encode_frame(
+            MsgType::Hello,
+            0,
+            &Hello {
+                protocol_version: tower_protocol::PROTOCOL_VERSION,
+                firmware_name: "radio_push_button",
+                firmware_version: "v0.1.0",
+                session_id: 1,
+            },
+            &mut buf,
+        )
+        .unwrap();
+        buf[..n].to_vec()
+    }
+
+    /// Run the real `describe()` role probe over a port scripted with a Hello (which the
+    /// probe ignores) followed by a `Describe` reply, then classify it through the gate.
+    fn gate_scripted(result: u8, data: &[u8]) -> GateDecision {
+        let mut m = Mock::new();
+        m.feed(&hello_frame());
+        m.feed(&mgmt_response(0x7000, result, data));
+        let mut dec = FrameDecoder::new();
+        let outcome = describe(&mut m, &mut dec, 0x7000, Duration::from_millis(300));
+        gate_describe("/dev/ttyTEST", outcome)
+    }
+
+    #[test]
+    fn wrong_role_node_yields_exit_126() {
+        // The role-gate contract: a dongle running node firmware answers the probe honestly
+        // with role Node, and the gate refuses it with EXIT_WRONG_FIRMWARE (126) — distinct
+        // from 124/125 so a script can say "flash the gateway firmware", not "check the cable".
+        assert_eq!(EXIT_WRONG_FIRMWARE, 126);
+        match gate_scripted(MGMT_OK, &device_info(DeviceRole::Node)) {
+            GateDecision::Reject(code) => assert_eq!(code, EXIT_WRONG_FIRMWARE),
+            _ => panic!("a node-role device must be refused"),
+        }
+    }
+
+    #[test]
+    fn role_other_yields_exit_126() {
+        match gate_scripted(MGMT_OK, &device_info(DeviceRole::Other)) {
+            GateDecision::Reject(code) => assert_eq!(code, EXIT_WRONG_FIRMWARE),
+            _ => panic!("a non-gateway role must be refused"),
+        }
+    }
+
+    #[test]
+    fn refused_probe_yields_exit_126() {
+        // The device answered the management channel but declined the op (a wrong/older role
+        // returns a non-OK result, no DeviceInfo record) — still "wrong firmware", exit 126.
+        match gate_scripted(MGMT_UNSUPPORTED, &[]) {
+            GateDecision::Reject(code) => assert_eq!(code, EXIT_WRONG_FIRMWARE),
+            _ => panic!("a refused role probe must be rejected"),
+        }
+    }
+
+    #[test]
+    fn gateway_role_is_accepted() {
+        match gate_scripted(MGMT_OK, &device_info(DeviceRole::Gateway)) {
+            GateDecision::Accept(info) => {
+                assert_eq!(info.role, DeviceRole::Gateway);
+                assert_eq!(info.net_id, 0xAB12);
+            }
+            _ => panic!("a gateway must be accepted"),
+        }
+    }
+
+    #[test]
+    fn version_mismatch_yields_exit_125_and_mute_retries() {
+        // The two non-Describe outcomes of the gate: a header version mismatch is the lockstep
+        // failure (125, not retryable); a mute probe is inconclusive and asks for a retry.
+        assert_eq!(EXIT_PROTOCOL_MISMATCH, 125);
+        match gate_describe(
+            "/dev/ttyTEST",
+            DescribeOutcome::Timeout {
+                bad_version: Some(1),
+            },
+        ) {
+            GateDecision::Reject(code) => assert_eq!(code, EXIT_PROTOCOL_MISMATCH),
+            _ => panic!("a version mismatch must be refused as 125"),
+        }
+        assert!(matches!(
+            gate_describe(
+                "/dev/ttyTEST",
+                DescribeOutcome::Timeout { bad_version: None }
+            ),
+            GateDecision::Retry
+        ));
     }
 }

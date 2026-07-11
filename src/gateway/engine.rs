@@ -1870,4 +1870,286 @@ mod tests {
                 .any(|o| matches!(o, Output::Subscribe(f) if f == "tower/gateway/cmd"))
         );
     }
+
+    // ---- shared helpers for the outcome-arm tests below ----
+
+    /// Deliver one `NodeMsg::Shell` reply chunk from `src` as an uplink.
+    fn shell_chunk_uplink(
+        e: &mut Engine,
+        src: u32,
+        cmd_id: u16,
+        chunk: u16,
+        last: bool,
+        text: &str,
+    ) -> Vec<Output> {
+        let mut env = [0u8; radio::MAX_RADIO_PAYLOAD];
+        let n = radio::encode_node_msg(
+            &NodeMsg::Shell(radio::NodeShellChunk {
+                cmd_id,
+                result: 0,
+                chunk,
+                last,
+                text,
+            }),
+            &mut env,
+        )
+        .unwrap();
+        e.handle(Input::SerialFrame(SerialMsg::Uplink {
+            src,
+            counter: chunk as u32,
+            rssi_dbm: -60,
+            lqi: 30,
+            data: env[..n].to_vec(),
+        }))
+    }
+
+    /// The last `ShellRsp` published to any `.../shell/rsp` topic in `out`.
+    fn last_shell_rsp(out: &[Output]) -> payload::ShellRsp {
+        let raw = out
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Output::Publish { topic, payload, .. } if topic.ends_with("/shell/rsp") => {
+                    Some(payload.clone())
+                }
+                _ => None,
+            })
+            .expect("a shell/rsp publish");
+        serde_json::from_slice(&raw).unwrap()
+    }
+
+    /// Install a node and queue one shell command against it; returns the queue `item`.
+    fn queue_shell(e: &mut Engine, id: u32, item: u16, rpc: &str, line: &str) {
+        with_node(e, id, "kitchen", NODE_FLAG_SLEEPING);
+        let req = format!(r#"{{"id":"{rpc}","line":"{line}"}}"#);
+        let out = e.handle(Input::MqttIn {
+            topic: format!("tower/nodes/{}/shell/req", topics::node_hex(id)),
+            payload: req.into_bytes(),
+        });
+        let (req_id, op) = out.iter().find_map(sent_op).expect("QueuePush goes out");
+        assert!(op.contains("QueuePush"), "{op}");
+        let qid = postcard::to_stdvec(&QueueId { item }).unwrap();
+        let _ = reply(e, req_id, MGMT_OK, &qid);
+    }
+
+    // ---- shell response: chunk-gap truncation ----
+
+    #[test]
+    fn shell_lost_chunk_marks_truncated() {
+        let mut e = engine();
+        queue_shell(&mut e, 0xAB12, 9, "u-1", "/log tail");
+        // Chunk 0 arrives cleanly (cmd_id 1 = the first allocated shell cmd_id).
+        let out = shell_chunk_uplink(&mut e, 0xAB12, 1, 0, false, "aa");
+        let rsp = last_shell_rsp(&out);
+        assert_eq!(
+            (rsp.chunk, rsp.text.as_str(), rsp.truncated),
+            (0, "aa", false)
+        );
+        // Chunk 1 was CRC-dropped: chunk 2 (last) opens a gap → truncated, but the text that
+        // did arrive is still delivered.
+        let out = shell_chunk_uplink(&mut e, 0xAB12, 1, 2, true, "cc");
+        let rsp = last_shell_rsp(&out);
+        assert_eq!((rsp.chunk, rsp.text.as_str(), rsp.done), (2, "cc", true));
+        assert!(
+            rsp.truncated,
+            "a chunk-index gap must flag the response truncated"
+        );
+    }
+
+    // ---- TX outcomes on a queued shell command ----
+
+    #[test]
+    fn tx_expired_fails_pending_shell_and_clears_it() {
+        let mut e = engine();
+        queue_shell(&mut e, 0xAB12, 9, "u-1", "/x");
+        // The gateway reports the queue item's TTL expired before it could be delivered.
+        let out = e.handle(Input::SerialFrame(SerialMsg::Stat(RadioStat::Tx {
+            dest: 0xAB12,
+            item: 9,
+            outcome: mgmt::TX_EXPIRED,
+            ack_rssi_dbm: None,
+        })));
+        let rsp = last_shell_rsp(&out);
+        assert!(rsp.done);
+        assert!(
+            rsp.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("TTL expired"),
+            "{:?}",
+            rsp.error
+        );
+        // The pending mirror is cleared.
+        let pend = publishes(&out, "tower/nodes/0x0000ab12/shell/pending");
+        let entries: Vec<PendingEntry> = serde_json::from_slice(pend.last().unwrap()).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn tx_delivered_then_reply_timeout() {
+        let mut e = engine();
+        queue_shell(&mut e, 0xAB12, 9, "u-1", "/x");
+        // Delivered (node ACKed): the pending stays — we now await the node's shell reply.
+        let out = e.handle(Input::SerialFrame(SerialMsg::Stat(RadioStat::Tx {
+            dest: 0xAB12,
+            item: 9,
+            outcome: mgmt::TX_DELIVERED,
+            ack_rssi_dbm: Some(-50),
+        })));
+        assert!(
+            publishes(&out, "tower/nodes/0x0000ab12/shell/rsp").is_empty(),
+            "delivery alone must not answer the dialog"
+        );
+        // No reply within SHELL_REPLY_TIMEOUT_TICKS → a terminal timeout error.
+        let mut timed_out = None;
+        for _ in 0..=SHELL_REPLY_TIMEOUT_TICKS {
+            let out = e.handle(Input::Tick);
+            if !publishes(&out, "tower/nodes/0x0000ab12/shell/rsp").is_empty() {
+                timed_out = Some(last_shell_rsp(&out));
+            }
+        }
+        let rsp = timed_out.expect("a delivered-but-unanswered command must time out");
+        assert!(rsp.done);
+        assert!(
+            rsp.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no reply"),
+            "{:?}",
+            rsp.error
+        );
+    }
+
+    // ---- on_mgmt_done arms ----
+
+    #[test]
+    fn reveal_key_answers_with_hex_key() {
+        let mut e = engine();
+        with_node(&mut e, 0xAB12, "kitchen", 0);
+        let out = e.handle(Input::MqttIn {
+            topic: "tower/gateway/cmd".into(),
+            payload: br#"{"id":"u-rk","op":"reveal_key","params":{"node":"0x0000ab12"}}"#.to_vec(),
+        });
+        let (req_id, op) = out.iter().find_map(sent_op).expect("NodeRevealKey issued");
+        assert!(op.contains("NodeRevealKey"), "{op}");
+        let key = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+            0x06, 0x07,
+        ];
+        let rec = postcard::to_stdvec(&NodeKey { id: 0xAB12, key }).unwrap();
+        let out = reply(&mut e, req_id, MGMT_OK, &rec);
+        let raw = publishes(&out, "tower/gateway/rsp/u-rk");
+        assert_eq!(raw.len(), 1);
+        let rsp: RpcResponse = serde_json::from_slice(raw[0]).unwrap();
+        assert!(rsp.ok);
+        assert_eq!(rsp.data["node"], "0x0000ab12");
+        assert_eq!(rsp.data["key"], "0123456789abcdef0001020304050607");
+    }
+
+    #[test]
+    fn node_remove_clears_retained_topics() {
+        let mut e = engine();
+        with_node(&mut e, 0xAB12, "kitchen", 0);
+        let out = e.handle(Input::MqttIn {
+            topic: "tower/gateway/cmd".into(),
+            payload: br#"{"id":"u-rm","op":"node_remove","params":{"node":"0x0000ab12"}}"#.to_vec(),
+        });
+        let (req_id, op) = out.iter().find_map(sent_op).expect("NodeRemove issued");
+        assert!(op.contains("NodeRemove"), "{op}");
+        let out = reply(&mut e, req_id, MGMT_OK, &[]);
+        // An empty retained payload clears the node, its last temperature, and its pending
+        // queue for any subscriber that held the retained value.
+        for topic in [
+            "tower/nodes/0x0000ab12",
+            "tower/nodes/0x0000ab12/measure/temperature",
+            "tower/nodes/0x0000ab12/shell/pending",
+        ] {
+            let cleared = out.iter().any(|o| {
+                matches!(o, Output::Publish { topic: t, payload, retain: true }
+                    if t == topic && payload.is_empty())
+            });
+            assert!(cleared, "missing empty retained publish for {topic}");
+        }
+        let rsp: RpcResponse =
+            serde_json::from_slice(publishes(&out, "tower/gateway/rsp/u-rm")[0]).unwrap();
+        assert!(rsp.ok);
+    }
+
+    #[test]
+    fn ota_pairing_timeout_answers_joined_null() {
+        let mut e = engine();
+        let out = e.handle(Input::MqttIn {
+            topic: "tower/gateway/cmd".into(),
+            payload: br#"{"id":"u-ota","op":"node_add_ota","params":{"window_s":5}}"#.to_vec(),
+        });
+        let (req_id, op) = out.iter().find_map(sent_op).expect("PairingOpen issued");
+        assert!(op.contains("PairingOpen"), "{op}");
+        // The window closed unjoined: the device answers MGMT_TIMEOUT. That is a normal
+        // outcome for a pairing window, so the RPC succeeds with joined:null (not an error).
+        let out = reply(&mut e, req_id, mgmt::MGMT_TIMEOUT, &[]);
+        let raw = publishes(&out, "tower/gateway/rsp/u-ota");
+        assert_eq!(raw.len(), 1);
+        let rsp: RpcResponse = serde_json::from_slice(raw[0]).unwrap();
+        assert!(rsp.ok, "MGMT_TIMEOUT on a pairing window is not an error");
+        assert!(rsp.data["joined"].is_null());
+    }
+
+    // ---- more uplink → topic mappings (alongside `button_uplink_maps_to_topic`) ----
+
+    #[test]
+    fn temperature_uplink_maps_to_retained_topic() {
+        let mut e = engine();
+        with_node(&mut e, 0xAB12, "kitchen", 0);
+        let mut env = [0u8; radio::MAX_RADIO_PAYLOAD];
+        let n = radio::encode_node_msg(&NodeMsg::Temperature { millic: 21500 }, &mut env).unwrap();
+        let out = e.handle(Input::SerialFrame(SerialMsg::Uplink {
+            src: 0xAB12,
+            counter: 3,
+            rssi_dbm: -60,
+            lqi: 30,
+            data: env[..n].to_vec(),
+        }));
+        let topic = "tower/nodes/0x0000ab12/measure/temperature";
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::Publish { topic: t, retain: true, .. } if t == topic)),
+            "temperature is a retained last-value topic"
+        );
+        let raw = publishes(&out, topic);
+        let t: payload::Temperature = serde_json::from_slice(raw[0]).unwrap();
+        assert_eq!((t.celsius, t.millic), (21.5, 21500));
+    }
+
+    #[test]
+    fn accel_uplink_maps_to_event_topic() {
+        let mut e = engine();
+        with_node(&mut e, 0xAB12, "kitchen", 0);
+        let mut env = [0u8; radio::MAX_RADIO_PAYLOAD];
+        let n = radio::encode_node_msg(
+            &NodeMsg::Accel {
+                kind: radio::AccelKind::Motion,
+                face: 0,
+            },
+            &mut env,
+        )
+        .unwrap();
+        let out = e.handle(Input::SerialFrame(SerialMsg::Uplink {
+            src: 0xAB12,
+            counter: 4,
+            rssi_dbm: -60,
+            lqi: 30,
+            data: env[..n].to_vec(),
+        }));
+        let topic = "tower/nodes/0x0000ab12/event/accel";
+        let raw = publishes(&out, topic);
+        assert_eq!(raw.len(), 1);
+        let a: payload::AccelEvent = serde_json::from_slice(raw[0]).unwrap();
+        assert_eq!((a.event.as_str(), a.face, a.counter), ("motion", 0, 4));
+        // Accel events are transient (not retained).
+        assert!(
+            out.iter().any(
+                |o| matches!(o, Output::Publish { topic: t, retain: false, .. } if t == topic)
+            )
+        );
+    }
 }

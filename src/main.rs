@@ -678,21 +678,33 @@ fn exec_cmd(
             return Ok(EXIT_PROTOCOL_MISMATCH);
         }
     }
+    exec_line(&mut *sp, &mut dec, &line, timeout)
+}
+
+/// Send one shell command line over an established session, print its reassembled response,
+/// and map the read outcome to the process exit code (see the exit-code contract). Split out
+/// of [`exec_cmd`] — which owns port selection + the optional `--reset` boot wait — so this
+/// send → read → map core runs unchanged over the real port and over an in-memory transport
+/// in tests (the reserved-code mapping, incl. the `result.clamp(1, 123)` guard, is the part
+/// worth pinning and it has no hardware in it).
+fn exec_line(
+    sp: &mut (impl crate::session::Transport + ?Sized),
+    dec: &mut FrameDecoder,
+    line: &str,
+    timeout: Duration,
+) -> Result<u8> {
     let cmd_id = exec_cmd_id();
     let mut buf = [0u8; tower_protocol::MAX_WIRE];
     let n = encode_frame(
         MsgType::ShellCommand,
         0,
-        &ShellCommand {
-            cmd_id,
-            line: &line,
-        },
+        &ShellCommand { cmd_id, line },
         &mut buf,
     )
     .map_err(|e| anyhow::anyhow!("encode: {e:?}"))?;
     sp.write_all(&buf[..n])?;
     sp.flush()?;
-    match read_response(&mut *sp, &mut dec, cmd_id, timeout) {
+    match read_response(&mut *sp, dec, cmd_id, timeout) {
         ReadOutcome::Response(r) => {
             print!("{}", r.text);
             if !r.text.is_empty() && !r.text.ends_with('\n') {
@@ -1364,6 +1376,77 @@ mod tests {
                 &mut buf,
             )
             .is_ok()
+        );
+    }
+
+    // ---- exec_line: the reserved-exit-code mapping (over a MockPort) ----
+    //
+    // `exec_cmd` opens/selects the port; `exec_line` is its hardware-free core (send →
+    // read_response → map to an exit code). These pin the mapping the outcome layer alone
+    // can't — especially the `result.clamp(1, 123)` guard that keeps a device result off the
+    // reserved 124/125 codes.
+
+    #[test]
+    fn exec_line_success_result_zero_is_exit_ok() {
+        let cmd_id = exec_cmd_id();
+        let mut sp = MockPort::new(shell_resp(cmd_id, 0, 0, true, "ok\n"));
+        let mut dec = FrameDecoder::new();
+        assert_eq!(exec_line(&mut sp, &mut dec, "/x", SHORT).unwrap(), EXIT_OK);
+        // The command line was actually put on the wire before we read.
+        assert!(!sp.written.is_empty());
+    }
+
+    #[test]
+    fn exec_line_incomplete_response_is_exit_error() {
+        // A dropped middle chunk (0 then 2) marks the response incomplete → EXIT_ERROR (1),
+        // even though the `last` chunk reported result 0 (that result is unreliable).
+        let cmd_id = exec_cmd_id();
+        let mut bytes = shell_resp(cmd_id, 0, 0, false, "a");
+        bytes.extend(shell_resp(cmd_id, 0, 2, true, "c"));
+        let mut sp = MockPort::new(bytes);
+        let mut dec = FrameDecoder::new();
+        assert_eq!(
+            exec_line(&mut sp, &mut dec, "/x", SHORT).unwrap(),
+            EXIT_ERROR
+        );
+    }
+
+    #[test]
+    fn exec_line_clamps_device_result_into_1_123() {
+        // A device result shares the exit-code byte with the reserved 124/125; a non-zero
+        // result is clamped into 1..=123 so a device result of 124 surfaces as 123, never as
+        // the reserved device-timeout code.
+        for (result, expect) in [(5u8, 5u8), (123, 123), (124, 123), (125, 123), (255, 123)] {
+            let cmd_id = exec_cmd_id();
+            let mut sp = MockPort::new(shell_resp(cmd_id, result, 0, true, "boom\n"));
+            let mut dec = FrameDecoder::new();
+            assert_eq!(
+                exec_line(&mut sp, &mut dec, "/x", SHORT).unwrap(),
+                expect,
+                "device result {result} must surface as {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_line_mute_device_is_device_timeout() {
+        let mut sp = MockPort::new(Vec::new());
+        let mut dec = FrameDecoder::new();
+        assert_eq!(
+            exec_line(&mut sp, &mut dec, "/x", SHORT).unwrap(),
+            EXIT_DEVICE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn exec_line_version_mismatch_is_protocol_mismatch() {
+        // Frames arrive, but every one is rejected at the header version: that's lockstep
+        // (125), not a mute device (124).
+        let mut sp = MockPort::new(hello_wire_bad_version(1));
+        let mut dec = FrameDecoder::new();
+        assert_eq!(
+            exec_line(&mut sp, &mut dec, "/x", SHORT).unwrap(),
+            EXIT_PROTOCOL_MISMATCH
         );
     }
 

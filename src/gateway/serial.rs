@@ -173,3 +173,228 @@ pub(crate) fn run(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_protocol::mgmt::MGMT_OK;
+    use tower_protocol::msg::{Dropped, Level, ShellResponse};
+    use tower_protocol::{MAX_WIRE, encode_frame};
+
+    /// Encode a real wire frame with `encode_frame`, then deframe it back to the inner bytes
+    /// `to_serial_msg` consumes (what `FrameDecoder::push` yields in the serial loop).
+    fn inner_of<T: serde::Serialize>(mt: MsgType, payload: &T) -> Vec<u8> {
+        let mut buf = [0u8; MAX_WIRE];
+        let n = encode_frame(mt, 0, payload, &mut buf).unwrap();
+        let mut dec = FrameDecoder::new();
+        buf[..n]
+            .iter()
+            .find_map(|&b| dec.push(b).map(|s| s.to_vec()))
+            .expect("one complete frame")
+    }
+
+    #[test]
+    fn uplink_frame_maps_to_uplink() {
+        let inner = inner_of(
+            MsgType::Uplink,
+            &Uplink {
+                src: 0xAB12,
+                counter: 42,
+                rssi_dbm: -67,
+                lqi: 30,
+                data: &[1, 2, 3],
+            },
+        );
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Uplink {
+                src,
+                counter,
+                rssi_dbm,
+                lqi,
+                data,
+            } => {
+                assert_eq!((src, counter, rssi_dbm, lqi), (0xAB12, 42, -67, 30));
+                assert_eq!(data, vec![1, 2, 3]);
+            }
+            other => panic!("expected Uplink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mgmt_response_frame_maps_to_mgmt() {
+        let inner = inner_of(
+            MsgType::MgmtResponse,
+            &MgmtResponse {
+                req_id: 7,
+                result: MGMT_OK,
+                chunk: 1,
+                last: true,
+                data: &[9, 9],
+            },
+        );
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Mgmt {
+                req_id,
+                result,
+                chunk,
+                last,
+                data,
+            } => {
+                assert_eq!((req_id, result, chunk, last), (7, MGMT_OK, 1, true));
+                assert_eq!(data, vec![9, 9]);
+            }
+            other => panic!("expected Mgmt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn radio_stat_frames_map_to_stat() {
+        let inner = inner_of(
+            MsgType::RadioStat,
+            &RadioStat::Tx {
+                dest: 0xAB12,
+                item: 5,
+                outcome: 0,
+                ack_rssi_dbm: Some(-40),
+            },
+        );
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Stat(RadioStat::Tx {
+                dest,
+                item,
+                outcome,
+                ack_rssi_dbm,
+            }) => assert_eq!(
+                (dest, item, outcome, ack_rssi_dbm),
+                (0xAB12, 5, 0, Some(-40))
+            ),
+            other => panic!("expected Stat(Tx), got {other:?}"),
+        }
+        let inner = inner_of(
+            MsgType::RadioStat,
+            &RadioStat::Channel {
+                channel: 3,
+                rssi_dbm: -98,
+            },
+        );
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Stat(RadioStat::Channel { channel, rssi_dbm }) => {
+                assert_eq!((channel, rssi_dbm), (3, -98))
+            }
+            other => panic!("expected Stat(Channel), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn print_frame_maps_to_trimmed_log() {
+        let inner = inner_of(
+            MsgType::Print,
+            &Print {
+                text: "hello world\n  ",
+            },
+        );
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Log { line } => assert_eq!(line, "hello world"),
+            other => panic!("expected Log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_frame_maps_to_formatted_log() {
+        let inner = inner_of(
+            MsgType::Log,
+            &Log {
+                level: Level::Info,
+                uptime_us: 1_234_567,
+                module: "radio",
+                message: "up",
+            },
+        );
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Log { line } => {
+                assert!(line.contains("INFO"), "{line}");
+                assert!(line.ends_with("radio: up"), "{line}");
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_and_dropped_frames_map() {
+        let inner = inner_of(
+            MsgType::Hello,
+            &Hello {
+                protocol_version: tower_protocol::PROTOCOL_VERSION,
+                firmware_name: "radio_dongle_gateway",
+                firmware_version: "v0.1.0",
+                session_id: 9,
+            },
+        );
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Hello {
+                firmware_name,
+                firmware_version,
+                session_id,
+            } => assert_eq!(
+                (
+                    firmware_name.as_str(),
+                    firmware_version.as_str(),
+                    session_id
+                ),
+                ("radio_dongle_gateway", "v0.1.0", 9)
+            ),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let inner = inner_of(MsgType::Dropped, &Dropped { count: 4 });
+        match to_serial_msg(&inner).expect("engine-relevant") {
+            SerialMsg::Dropped(n) => assert_eq!(n, 4),
+            other => panic!("expected Dropped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bad_version_frame_becomes_protocol_mismatch_log() {
+        // A deframed inner whose header advertises v1 (not the current v3): `decode_frame`
+        // rejects it at the version check (before CRC), and `to_serial_msg` surfaces the
+        // mismatch as a Log line rather than silently dropping it — the mid-session reflash
+        // to older firmware the doc comment calls out. Build the inner directly (the host's
+        // own encoder always stamps the current version).
+        let mut inner = vec![(1u8 << 5) | (MsgType::Hello as u8 & 0x1F), 0, 0];
+        inner.extend_from_slice(&[0, 0, 0, 0]); // filler CRC — version fails before it's read
+        match to_serial_msg(&inner).expect("a mismatch surfaces as a Log") {
+            SerialMsg::Log { line } => {
+                assert!(line.contains("PROTOCOL MISMATCH"), "{line}");
+                assert!(line.contains("v1"), "{line}");
+            }
+            other => panic!("expected Log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_engine_and_corrupt_frames_are_ignored() {
+        // A ShellResponse belongs to `tower shell`, not the gateway → the `_ => None` arm.
+        let inner = inner_of(
+            MsgType::ShellResponse,
+            &ShellResponse {
+                cmd_id: 1,
+                result: 0,
+                chunk: 0,
+                last: true,
+                text: "hi",
+            },
+        );
+        assert!(to_serial_msg(&inner).is_none());
+        // A CRC-corrupt frame decodes to `Err(_)` → dropped (None).
+        let mut inner = inner_of(
+            MsgType::Log,
+            &Log {
+                level: Level::Info,
+                uptime_us: 0,
+                module: "m",
+                message: "x",
+            },
+        );
+        inner[3] ^= 0xFF; // flip a payload byte → CRC mismatch
+        assert!(to_serial_msg(&inner).is_none());
+    }
+}

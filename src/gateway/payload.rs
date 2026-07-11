@@ -311,6 +311,173 @@ mod tests {
     }
 
     #[test]
+    fn golden_stats() {
+        // `Stats` has no `skip_serializing_if`: absent ambient samples serialize as `null`
+        // (present as the value) — pin both so a subscriber sees stable keys.
+        let s = Stats {
+            uptime_s: 3600,
+            nodes: 2,
+            uplinks: 42,
+            queued: 1,
+            rssi_dbm: None,
+            channel: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"uptime_s":3600,"nodes":2,"uplinks":42,"queued":1,"rssi_dbm":null,"channel":null}"#
+        );
+        let s = Stats {
+            rssi_dbm: Some(-98),
+            channel: Some(3),
+            ..s
+        };
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"uptime_s":3600,"nodes":2,"uplinks":42,"queued":1,"rssi_dbm":-98,"channel":3}"#
+        );
+    }
+
+    #[test]
+    fn golden_pairing() {
+        // `remaining_s`/`joined` are `skip_serializing_if = Option::is_none`: the open window
+        // carries the countdown, the idle state omits both keys entirely.
+        let open = Pairing {
+            state: "open".into(),
+            remaining_s: Some(45),
+            joined: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&open).unwrap(),
+            r#"{"state":"open","remaining_s":45}"#
+        );
+        let idle = Pairing {
+            state: "idle".into(),
+            remaining_s: None,
+            joined: None,
+        };
+        assert_eq!(serde_json::to_string(&idle).unwrap(), r#"{"state":"idle"}"#);
+        let joined = Pairing {
+            state: "idle".into(),
+            remaining_s: None,
+            joined: Some("0x0000ab12".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&joined).unwrap(),
+            r#"{"state":"idle","joined":"0x0000ab12"}"#
+        );
+    }
+
+    #[test]
+    fn golden_temperature() {
+        let t = Temperature {
+            celsius: 21.5,
+            millic: 21500,
+            ts: 1_700_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            r#"{"celsius":21.5,"millic":21500,"ts":1700000000}"#
+        );
+    }
+
+    #[test]
+    fn golden_accel_event() {
+        let e = AccelEvent {
+            event: "orientation".into(),
+            face: 3,
+            counter: 7,
+            ts: 1_700_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"event":"orientation","face":3,"counter":7,"ts":1700000000}"#
+        );
+    }
+
+    #[test]
+    fn golden_uplink_debug() {
+        let u = UplinkDebug {
+            counter: 5,
+            rssi_dbm: -67,
+            lqi: 30,
+            len: 3,
+            hex: "aabbcc".into(),
+            ts: 1_700_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&u).unwrap(),
+            r#"{"counter":5,"rssi_dbm":-67,"lqi":30,"len":3,"hex":"aabbcc","ts":1700000000}"#
+        );
+    }
+
+    #[test]
+    fn golden_radio_rssi() {
+        let r = RadioRssi {
+            dbm: -98,
+            channel: 0,
+            ts: 1_700_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"dbm":-98,"channel":0,"ts":1700000000}"#
+        );
+    }
+
+    #[test]
+    fn golden_radio_rx() {
+        let r = RadioRx {
+            src: "0x0000ab12".into(),
+            rssi_dbm: -67,
+            lqi: 30,
+            len: 3,
+            ts: 1_700_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"src":"0x0000ab12","rssi_dbm":-67,"lqi":30,"len":3,"ts":1700000000}"#
+        );
+    }
+
+    #[test]
+    fn golden_radio_tx() {
+        // `ack_rssi_dbm` has no skip: a missing ACK serializes as `null`.
+        let t = RadioTx {
+            dest: "0x0000ab12".into(),
+            item: 9,
+            outcome: "delivered".into(),
+            ack_rssi_dbm: Some(-42),
+            ts: 1_700_000_000,
+        };
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            r#"{"dest":"0x0000ab12","item":9,"outcome":"delivered","ack_rssi_dbm":-42,"ts":1700000000}"#
+        );
+        let t = RadioTx {
+            ack_rssi_dbm: None,
+            ..t
+        };
+        assert_eq!(
+            serde_json::to_string(&t).unwrap(),
+            r#"{"dest":"0x0000ab12","item":9,"outcome":"delivered","ack_rssi_dbm":null,"ts":1700000000}"#
+        );
+    }
+
+    #[test]
+    fn golden_pending_entry() {
+        // The `r#ref` field serializes as the bare key `ref` (its raw-identifier prefix is
+        // a Rust keyword escape, not part of the wire name).
+        let e = PendingEntry {
+            r#ref: 9,
+            id: "u-1".into(),
+            line: "/led on".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&e).unwrap(),
+            r#"{"ref":9,"id":"u-1","line":"/led on"}"#
+        );
+    }
+
+    #[test]
     fn shell_req_defaults() {
         let r: ShellReq = serde_json::from_str(r#"{"id":"x","line":"/led on"}"#).unwrap();
         assert_eq!(r.ttl_s, 0, "absent ttl_s defaults to 0 (gateway default)");

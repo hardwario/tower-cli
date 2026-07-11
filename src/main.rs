@@ -23,6 +23,9 @@ use rustyline::{Editor, Helper};
 use tower_protocol::msg::{CandidateKind, ShellCommand};
 use tower_protocol::{FrameDecoder, MsgType, decode_frame, encode_frame};
 
+mod client;
+mod gateway;
+mod mgmt;
 mod port;
 mod render;
 mod session;
@@ -57,6 +60,10 @@ use session::{
 const EXIT_OK: u8 = 0;
 const EXIT_ERROR: u8 = 1;
 const EXIT_DEVICE_TIMEOUT: u8 = 124;
+/// The attached device answered the management role probe with the wrong role (or refused
+/// it): e.g. `tower gateway` pointed at a node, or `nodes add --port` at a gateway. Distinct
+/// from 124/125 so scripts can say "flash the right firmware" instead of "check the cable".
+const EXIT_WRONG_FIRMWARE: u8 = 126;
 /// A freshly-reset device announced (or its frames were tagged with) a `tower-protocol`
 /// version this build doesn't speak — every frame would silently mis-decode, so `exec`
 /// refuses rather than emitting junk. Distinct from a plain timeout so CI can branch on it.
@@ -263,6 +270,22 @@ enum Cmd {
         #[arg(long)]
         bootloader: bool,
     },
+    /// Bridge the radio network to MQTT (TUI by default; --service for headless).
+    Gateway(gateway::GatewayOpts),
+    /// Manage the gateway's nodes over MQTT (list/add/remove/rename/shell/…).
+    Nodes {
+        #[command(subcommand)]
+        cmd: client::nodes::NodesCmd,
+        #[command(flatten)]
+        mqtt: client::MqttOpts,
+    },
+    /// Network/gateway health over MQTT.
+    Net {
+        #[command(subcommand)]
+        cmd: client::net::NetCmd,
+        #[command(flatten)]
+        mqtt: client::MqttOpts,
+    },
 }
 
 fn main() -> ExitCode {
@@ -348,6 +371,9 @@ fn run(cli: Cli) -> Result<u8> {
         }
         Cmd::Erase { verbose } => erase_cmd(cli.port, verbose).map(|()| EXIT_OK),
         Cmd::Reset { bootloader } => reset_cmd(cli.port, bootloader).map(|()| EXIT_OK),
+        Cmd::Gateway(opts) => gateway::run(cli.port, opts),
+        Cmd::Nodes { cmd, mqtt } => client::nodes::run(cmd, mqtt),
+        Cmd::Net { cmd, mqtt } => client::net::run(cmd, mqtt),
     }
 }
 

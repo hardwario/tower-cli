@@ -11,8 +11,15 @@ repository = "https://github.com/hardwario/tower-cli"
 name = "tower"
 path = "src/main.rs"
 
+[features]
+# The embedded MQTT broker (`tower gateway --broker`, the zero-config default). Default-on;
+# opt out (`--no-default-features`) if rumqttd's dependency weight ever hurts a build target —
+# external-broker mode (`--mqtt`) keeps working without it.
+default = ["embedded-broker"]
+embedded-broker = ["dep:rumqttd"]
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serialport = "4"
 rustyline = "18"
 ratatui = "0.30"
@@ -20,8 +27,21 @@ anyhow = "1"
 # Flash/erase progress bars (same version the standalone `jolt` CLI renders with).
 indicatif = "0.18"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-postcard = { version = "1", default-features = false }
-serde = "1"
+# `use-std`: the gateway engine builds owned frames/records with `to_stdvec` (this is
+# a host binary; the no-alloc discipline is the firmware's constraint, not ours).
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+# The gateway's MQTT side (`tower gateway` + the `nodes`/`net` client commands). rumqttc's
+# synchronous Client/Connection API keeps the crate's no-async idiom — tokio appears only as
+# an internal dependency of these two crates, never in our code.
+rumqttc = "0.25"
+rumqttd = { version = "0.20", optional = true }
+serde_json = "1"
+# RPC correlation ids for the MQTT request/response topics.
+uuid = { version = "1", features = ["v4"] }
+# CSPRNG for minting per-node AES keys (the device PRNGs are explicitly
+# non-cryptographic, so the host is the only place keys may be generated).
+getrandom = { version = "0.3", features = ["std"] }
 # Single source of truth for the wire format, shared with the firmware (which depends on the
 # same crate + tag). postcard isn't self-describing, so both ends MUST be the same version —
 # pinned to a tag so a standalone clone builds reproducibly. Bump in lockstep with any wire

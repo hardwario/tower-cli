@@ -104,3 +104,66 @@ fn console_nonexistent_device_first_open_is_fatal() {
         .code(1)
         .stderr(predicate::str::contains("error"));
 }
+
+// ---- gateway / nodes / net surfaces (no hardware, no broker) ---------------------
+
+#[test]
+fn gateway_help_lists_modes() {
+    Command::cargo_bin("tower")
+        .unwrap()
+        .args(["gateway", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--service"))
+        .stdout(predicates::str::contains("--mqtt"))
+        .stdout(predicates::str::contains("--prefix"));
+}
+
+#[test]
+fn nodes_help_lists_subcommands() {
+    Command::cargo_bin("tower")
+        .unwrap()
+        .args(["nodes", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("list"))
+        .stdout(predicates::str::contains("add"))
+        .stdout(predicates::str::contains("shell"))
+        .stdout(predicates::str::contains("dequeue"));
+}
+
+#[test]
+fn gateway_broker_conflicts_with_mqtt() {
+    // Usage errors are clap's: exit 2.
+    Command::cargo_bin("tower")
+        .unwrap()
+        .args([
+            "gateway",
+            "--broker",
+            "127.0.0.1:1883",
+            "--mqtt",
+            "host:1883",
+        ])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn nodes_list_fails_fast_without_broker() {
+    // Port 1 is never a broker: a clean tool error (1), not a hang.
+    Command::cargo_bin("tower")
+        .unwrap()
+        .args(["nodes", "list", "--mqtt", "127.0.0.1:1", "--timeout", "500"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error"));
+}
+
+#[test]
+fn net_status_fails_fast_without_broker() {
+    Command::cargo_bin("tower")
+        .unwrap()
+        .args(["net", "status", "--mqtt", "127.0.0.1:1", "--timeout", "500"])
+        .assert()
+        .code(1);
+}

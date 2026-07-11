@@ -112,7 +112,7 @@ pub(crate) enum Event {
     Log(String),
     /// Link state changed.
     Link { serial_up: bool, mqtt_up: bool },
-    /// The registry mirror changed (full snapshot — ≤32 nodes, cheap).
+    /// The registry mirror changed (full snapshot — ≤16 nodes, cheap).
     Registry(Vec<NodeView>),
     /// A remote-shell response chunk (or terminal error) for a node's dialog.
     Shell { node: u32, rsp: payload::ShellRsp },

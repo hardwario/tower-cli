@@ -106,6 +106,15 @@ pub(crate) enum Inbound {
     Other,
 }
 
+/// The node a topic belongs to: `nodes/{addr}` or `nodes/{addr}/…` under `prefix`
+/// → that address; anything else (gateway/*, radio/*, foreign) → `None`. Drives the
+/// TUI's per-node MQTT-feed filter.
+pub(crate) fn node_of(prefix: &str, topic: &str) -> Option<u32> {
+    let tail = topic.strip_prefix(prefix)?.strip_prefix("nodes/")?;
+    let hex = tail.split('/').next()?;
+    parse_node_hex(hex)
+}
+
 /// Classify an inbound topic (the engine subscribes to `gateway/cmd` and
 /// `nodes/+/shell/req`).
 pub(crate) fn classify(prefix: &str, topic: &str) -> Inbound {
@@ -156,6 +165,21 @@ mod tests {
         assert_eq!(gateway_rsp(p, "xyz"), "tower/gateway/rsp/xyz");
         // No prefix works too (empty prefix = broker root).
         assert_eq!(gateway_cmd(""), "gateway/cmd");
+    }
+
+    #[test]
+    fn node_of_extracts_the_node_topics_only() {
+        let p = "tower/";
+        assert_eq!(node_of(p, "tower/nodes/0x0000ab12"), Some(0xAB12));
+        assert_eq!(
+            node_of(p, "tower/nodes/0x0000ab12/event/button"),
+            Some(0xAB12)
+        );
+        assert_eq!(node_of(p, "tower/nodes/0x0000ab12/shell/req"), Some(0xAB12));
+        assert_eq!(node_of(p, "tower/gateway/status"), None);
+        assert_eq!(node_of(p, "tower/radio/rssi"), None);
+        assert_eq!(node_of(p, "other/nodes/0x0000ab12"), None);
+        assert_eq!(node_of(p, "tower/nodes/garbage"), None);
     }
 
     #[test]

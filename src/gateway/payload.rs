@@ -8,8 +8,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Version of this topic/payload tree, carried in the retained `gateway/status`.
-/// Bumped 1→2 when the radio-address terminology was unified (`nodes` payload key
-/// `id`→`addr`; RPC node-address param `id`/`node`→`addr`).
+/// Bumped 1→2 when the terminology was unified: node-address keys/params
+/// `id`/`node`→`addr`, and every unit suffix dropped from key names
+/// (`last_seen_s`→`last_seen`, `uptime_s`→`uptime`, `remaining_s`→`remaining`,
+/// `ttl_s`→`ttl`, `age_s`→`age`, `window_s`→`window`, `rssi_dbm`→`rssi`,
+/// `ack_rssi_dbm`→`ack_rssi`) — units live in the field docs, not the names.
+/// One bump: schema 2 never shipped in a tagged release between the renames.
 pub(crate) const SCHEMA: u32 = 2;
 
 /// `gateway/status` (retained). The LWT publishes only `{state:"offline", schema}` —
@@ -41,12 +45,12 @@ impl Status {
 /// `gateway/stats` (retained, refreshed on a slow tick).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct Stats {
-    pub uptime_s: u64,
+    pub uptime: u64,
     pub nodes: u32,
     pub uplinks: u64,
     pub queued: u32,
     /// Last ambient channel-RSSI sample, if any.
-    pub rssi_dbm: Option<i16>,
+    pub rssi: Option<i16>,
     pub channel: Option<u8>,
 }
 
@@ -57,7 +61,7 @@ pub(crate) struct Pairing {
     pub state: String,
     /// Seconds until the open window closes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub remaining_s: Option<u64>,
+    pub remaining: Option<u64>,
     /// The node that joined (set on the final `idle` transition after a join).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub joined: Option<String>,
@@ -75,8 +79,8 @@ pub(crate) struct Node {
     /// No operator/auto name assigned yet.
     pub unnamed: bool,
     /// Seconds since the last uplink at publish time; `null` = never (since gateway boot).
-    pub last_seen_s: Option<u32>,
-    pub rssi_dbm: Option<i8>,
+    pub last_seen: Option<u32>,
+    pub rssi: Option<i8>,
     pub uplinks: u32,
     /// Downlink items currently queued on the gateway.
     pub queued: u8,
@@ -117,7 +121,7 @@ pub(crate) struct Temperature {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct UplinkDebug {
     pub counter: u32,
-    pub rssi_dbm: i16,
+    pub rssi: i16,
     pub lqi: u8,
     pub len: usize,
     pub hex: String,
@@ -132,7 +136,7 @@ pub(crate) struct ShellReq {
     pub line: String,
     /// Queue TTL; 0/absent = the gateway default (3600 s).
     #[serde(default)]
-    pub ttl_s: u16,
+    pub ttl: u16,
 }
 
 /// `nodes/{addr}/shell/rsp` (gateway → clients): one response chunk.
@@ -174,7 +178,7 @@ pub(crate) struct RadioRssi {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct RadioRx {
     pub src: String,
-    pub rssi_dbm: i16,
+    pub rssi: i16,
     pub lqi: u8,
     pub len: usize,
     pub ts: u64,
@@ -188,7 +192,7 @@ pub(crate) struct RadioTx {
     pub item: u16,
     /// `delivered` | `not-delivered` | `busy` | `duty-limited` | `error` | `expired`.
     pub outcome: String,
-    pub ack_rssi_dbm: Option<i8>,
+    pub ack_rssi: Option<i8>,
     pub ts: u64,
 }
 
@@ -288,14 +292,14 @@ mod tests {
             kind: "push-button".into(),
             sleeping: true,
             unnamed: false,
-            last_seen_s: Some(3),
-            rssi_dbm: Some(-67),
+            last_seen: Some(3),
+            rssi: Some(-67),
             uplinks: 12,
             queued: 1,
         };
         assert_eq!(
             serde_json::to_string(&n).unwrap(),
-            r#"{"addr":"0x0000ab12","name":"kitchen","kind":"push-button","sleeping":true,"unnamed":false,"last_seen_s":3,"rssi_dbm":-67,"uplinks":12,"queued":1}"#
+            r#"{"addr":"0x0000ab12","name":"kitchen","kind":"push-button","sleeping":true,"unnamed":false,"last_seen":3,"rssi":-67,"uplinks":12,"queued":1}"#
         );
     }
 
@@ -321,50 +325,50 @@ mod tests {
         // `Stats` has no `skip_serializing_if`: absent ambient samples serialize as `null`
         // (present as the value) — pin both so a subscriber sees stable keys.
         let s = Stats {
-            uptime_s: 3600,
+            uptime: 3600,
             nodes: 2,
             uplinks: 42,
             queued: 1,
-            rssi_dbm: None,
+            rssi: None,
             channel: None,
         };
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
-            r#"{"uptime_s":3600,"nodes":2,"uplinks":42,"queued":1,"rssi_dbm":null,"channel":null}"#
+            r#"{"uptime":3600,"nodes":2,"uplinks":42,"queued":1,"rssi":null,"channel":null}"#
         );
         let s = Stats {
-            rssi_dbm: Some(-98),
+            rssi: Some(-98),
             channel: Some(3),
             ..s
         };
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
-            r#"{"uptime_s":3600,"nodes":2,"uplinks":42,"queued":1,"rssi_dbm":-98,"channel":3}"#
+            r#"{"uptime":3600,"nodes":2,"uplinks":42,"queued":1,"rssi":-98,"channel":3}"#
         );
     }
 
     #[test]
     fn golden_pairing() {
-        // `remaining_s`/`joined` are `skip_serializing_if = Option::is_none`: the open window
+        // `remaining`/`joined` are `skip_serializing_if = Option::is_none`: the open window
         // carries the countdown, the idle state omits both keys entirely.
         let open = Pairing {
             state: "open".into(),
-            remaining_s: Some(45),
+            remaining: Some(45),
             joined: None,
         };
         assert_eq!(
             serde_json::to_string(&open).unwrap(),
-            r#"{"state":"open","remaining_s":45}"#
+            r#"{"state":"open","remaining":45}"#
         );
         let idle = Pairing {
             state: "idle".into(),
-            remaining_s: None,
+            remaining: None,
             joined: None,
         };
         assert_eq!(serde_json::to_string(&idle).unwrap(), r#"{"state":"idle"}"#);
         let joined = Pairing {
             state: "idle".into(),
-            remaining_s: None,
+            remaining: None,
             joined: Some("0x0000ab12".into()),
         };
         assert_eq!(
@@ -404,7 +408,7 @@ mod tests {
     fn golden_uplink_debug() {
         let u = UplinkDebug {
             counter: 5,
-            rssi_dbm: -67,
+            rssi: -67,
             lqi: 30,
             len: 3,
             hex: "aabbcc".into(),
@@ -412,7 +416,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&u).unwrap(),
-            r#"{"counter":5,"rssi_dbm":-67,"lqi":30,"len":3,"hex":"aabbcc","ts":1700000000}"#
+            r#"{"counter":5,"rssi":-67,"lqi":30,"len":3,"hex":"aabbcc","ts":1700000000}"#
         );
     }
 
@@ -433,38 +437,38 @@ mod tests {
     fn golden_radio_rx() {
         let r = RadioRx {
             src: "0x0000ab12".into(),
-            rssi_dbm: -67,
+            rssi: -67,
             lqi: 30,
             len: 3,
             ts: 1_700_000_000,
         };
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
-            r#"{"src":"0x0000ab12","rssi_dbm":-67,"lqi":30,"len":3,"ts":1700000000}"#
+            r#"{"src":"0x0000ab12","rssi":-67,"lqi":30,"len":3,"ts":1700000000}"#
         );
     }
 
     #[test]
     fn golden_radio_tx() {
-        // `ack_rssi_dbm` has no skip: a missing ACK serializes as `null`.
+        // `ack_rssi` has no skip: a missing ACK serializes as `null`.
         let t = RadioTx {
             dest: "0x0000ab12".into(),
             item: 9,
             outcome: "delivered".into(),
-            ack_rssi_dbm: Some(-42),
+            ack_rssi: Some(-42),
             ts: 1_700_000_000,
         };
         assert_eq!(
             serde_json::to_string(&t).unwrap(),
-            r#"{"dest":"0x0000ab12","item":9,"outcome":"delivered","ack_rssi_dbm":-42,"ts":1700000000}"#
+            r#"{"dest":"0x0000ab12","item":9,"outcome":"delivered","ack_rssi":-42,"ts":1700000000}"#
         );
         let t = RadioTx {
-            ack_rssi_dbm: None,
+            ack_rssi: None,
             ..t
         };
         assert_eq!(
             serde_json::to_string(&t).unwrap(),
-            r#"{"dest":"0x0000ab12","item":9,"outcome":"delivered","ack_rssi_dbm":null,"ts":1700000000}"#
+            r#"{"dest":"0x0000ab12","item":9,"outcome":"delivered","ack_rssi":null,"ts":1700000000}"#
         );
     }
 
@@ -486,7 +490,7 @@ mod tests {
     #[test]
     fn shell_req_defaults() {
         let r: ShellReq = serde_json::from_str(r#"{"id":"x","line":"/led on"}"#).unwrap();
-        assert_eq!(r.ttl_s, 0, "absent ttl_s defaults to 0 (gateway default)");
+        assert_eq!(r.ttl, 0, "absent ttl defaults to 0 (gateway default)");
     }
 
     #[test]

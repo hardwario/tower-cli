@@ -48,8 +48,8 @@ pub(crate) fn run(events: Receiver<Event>) {
             }
             // The graph feed is TUI food — too chatty for a service log.
             Event::Radio(RadioSample::Ambient { .. }) => {}
-            Event::Radio(RadioSample::Rx { src, rssi_dbm }) => {
-                line(&format!("rx {src:08x} {rssi_dbm} dBm"));
+            Event::Radio(RadioSample::Rx { src, rssi }) => {
+                line(&format!("rx {src:08x} {rssi} dBm"));
             }
             Event::Radio(RadioSample::Tx { dest, delivered }) => {
                 line(&format!(
@@ -59,7 +59,10 @@ pub(crate) fn run(events: Receiver<Event>) {
             }
             // In-process RPCs only exist in TUI mode.
             Event::Rpc(_) => {}
-            Event::Pairing(p) => match p.remaining_s {
+            // The mirrored MQTT stream is TUI feed food — a service operator can
+            // watch the broker directly (`mosquitto_sub -t 'tower/#'`).
+            Event::Mqtt(_) => {}
+            Event::Pairing(p) => match p.remaining {
                 Some(s) if p.state == "open" => line(&format!("pairing window open ({s}s left)")),
                 _ => {
                     if let Some(j) = p.joined {

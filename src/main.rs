@@ -25,6 +25,7 @@ use tower_protocol::{FrameDecoder, MsgType, decode_frame, encode_frame};
 
 mod client;
 mod gateway;
+mod highlight;
 mod mgmt;
 mod port;
 mod render;

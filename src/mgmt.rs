@@ -54,8 +54,8 @@ pub(crate) struct NodeEntryOwned {
     pub addr: u32,
     pub name: String,
     pub flags: u8,
-    pub last_seen_s: u32,
-    pub rssi_dbm: i8,
+    pub last_seen: u32,
+    pub rssi: i8,
     pub uplinks: u32,
     pub queued: u8,
 }
@@ -66,8 +66,8 @@ impl From<NodeEntry<'_>> for NodeEntryOwned {
             addr: e.addr,
             name: e.name.to_string(),
             flags: e.flags,
-            last_seen_s: e.last_seen_s,
-            rssi_dbm: e.rssi_dbm,
+            last_seen: e.last_seen,
+            rssi: e.rssi,
             uplinks: e.uplinks,
             queued: e.queued,
         }
@@ -82,8 +82,8 @@ impl From<NodeEntry<'_>> for NodeEntryOwned {
 pub(crate) struct QueueEntryOwned {
     pub node_addr: u32,
     pub item: u16,
-    pub age_s: u16,
-    pub ttl_s: u16,
+    pub age: u16,
+    pub ttl: u16,
     pub data: Vec<u8>,
 }
 
@@ -92,8 +92,8 @@ impl From<QueueEntry<'_>> for QueueEntryOwned {
         Self {
             node_addr: e.node_addr,
             item: e.item,
-            age_s: e.age_s,
-            ttl_s: e.ttl_s,
+            age: e.age,
+            ttl: e.ttl,
             data: e.data.to_vec(),
         }
     }
@@ -420,8 +420,8 @@ mod tests {
             addr: 1,
             name: "a",
             flags: 0,
-            last_seen_s: 5,
-            rssi_dbm: -60,
+            last_seen: 5,
+            rssi: -60,
             uplinks: 2,
             queued: 0,
         };
@@ -429,8 +429,8 @@ mod tests {
             addr: 2,
             name: "b",
             flags: 1,
-            last_seen_s: u32::MAX,
-            rssi_dbm: i8::MAX,
+            last_seen: u32::MAX,
+            rssi: i8::MAX,
             uplinks: 0,
             queued: 1,
         };

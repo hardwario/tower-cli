@@ -3471,8 +3471,8 @@ checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
 
 [[package]]
 name = "tower-protocol"
-version = "1.4.0"
-source = "git+https://github.com/hardwario/tower-protocol?tag=v1.4.0#aab9d2e7061395cbf5d8cbd92a573de2cbe417a0"
+version = "1.5.0"
+source = "git+https://github.com/hardwario/tower-protocol?tag=v1.5.0#2351ea071300944fef5db5e709ebc46a0c48df1c"
 dependencies = [
  "cobs 0.5.1",
  "heapless",

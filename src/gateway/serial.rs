@@ -60,7 +60,7 @@ pub(crate) fn to_serial_msg(inner: &[u8]) -> Option<SerialMsg> {
                 .map(|u| SerialMsg::Uplink {
                     src: u.src,
                     counter: u.counter,
-                    rssi_dbm: u.rssi_dbm,
+                    rssi: u.rssi,
                     lqi: u.lqi,
                     data: u.data.to_vec(),
                 })
@@ -200,7 +200,7 @@ mod tests {
             &Uplink {
                 src: 0xAB12,
                 counter: 42,
-                rssi_dbm: -67,
+                rssi: -67,
                 lqi: 30,
                 data: &[1, 2, 3],
             },
@@ -209,11 +209,11 @@ mod tests {
             SerialMsg::Uplink {
                 src,
                 counter,
-                rssi_dbm,
+                rssi,
                 lqi,
                 data,
             } => {
-                assert_eq!((src, counter, rssi_dbm, lqi), (0xAB12, 42, -67, 30));
+                assert_eq!((src, counter, rssi, lqi), (0xAB12, 42, -67, 30));
                 assert_eq!(data, vec![1, 2, 3]);
             }
             other => panic!("expected Uplink, got {other:?}"),
@@ -255,7 +255,7 @@ mod tests {
                 dest: 0xAB12,
                 item: 5,
                 outcome: 0,
-                ack_rssi_dbm: Some(-40),
+                ack_rssi: Some(-40),
             },
         );
         match to_serial_msg(&inner).expect("engine-relevant") {
@@ -263,23 +263,20 @@ mod tests {
                 dest,
                 item,
                 outcome,
-                ack_rssi_dbm,
-            }) => assert_eq!(
-                (dest, item, outcome, ack_rssi_dbm),
-                (0xAB12, 5, 0, Some(-40))
-            ),
+                ack_rssi,
+            }) => assert_eq!((dest, item, outcome, ack_rssi), (0xAB12, 5, 0, Some(-40))),
             other => panic!("expected Stat(Tx), got {other:?}"),
         }
         let inner = inner_of(
             MsgType::RadioStat,
             &RadioStat::Channel {
                 channel: 3,
-                rssi_dbm: -98,
+                rssi: -98,
             },
         );
         match to_serial_msg(&inner).expect("engine-relevant") {
-            SerialMsg::Stat(RadioStat::Channel { channel, rssi_dbm }) => {
-                assert_eq!((channel, rssi_dbm), (3, -98))
+            SerialMsg::Stat(RadioStat::Channel { channel, rssi }) => {
+                assert_eq!((channel, rssi), (3, -98))
             }
             other => panic!("expected Stat(Channel), got {other:?}"),
         }

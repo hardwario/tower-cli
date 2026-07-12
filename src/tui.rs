@@ -524,11 +524,21 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             }
             return;
         }
-        KeyCode::BackTab => {
+        // F1 walks the panes clockwise; Shift-F1 counter-clockwise. (Some
+        // terminals report Shift-F1 as F13 — accept both.)
+        KeyCode::F(1) if !mods.contains(KeyModifiers::SHIFT) => {
             app.focus = match app.focus {
                 Pane::Shell => Pane::Events,
                 Pane::Events => Pane::Logs,
                 Pane::Logs => Pane::Shell,
+            };
+            return;
+        }
+        KeyCode::F(1) | KeyCode::F(13) => {
+            app.focus = match app.focus {
+                Pane::Shell => Pane::Logs,
+                Pane::Logs => Pane::Events,
+                Pane::Events => Pane::Shell,
             };
             return;
         }
@@ -893,7 +903,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
     };
     let footer = Line::from(vec![
-        Span::raw(" <Shift-Tab> Focus  "),
+        Span::raw(" <F1> Focus  "),
         chip("<F3> Zoom", app.zoom),
         Span::raw("  "),
         chip("<F5> Pause", app.paused),
@@ -1084,7 +1094,7 @@ fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         false,
         &app.responses,
         app.scroll[2],
-        |s: &String| highlight_response(s),
+        |s: &String| crate::highlight::response(s),
     );
 
     // Prompt line: "> " + the input (highlighted), or the placeholder on an empty line.
@@ -1102,7 +1112,7 @@ fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         ])
     } else {
         let mut spans = vec![prompt];
-        spans.extend(highlight_command(&app.input));
+        spans.extend(crate::highlight::command(&app.input));
         Line::from(spans)
     };
     f.render_widget(Paragraph::new(line), rows[1]);
@@ -1129,83 +1139,6 @@ fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
 // One color per syntactic class (shared by the input line and response lines):
 // tree paths cyan (separators dim), bare command words yellow, keys magenta,
 // values green, punctuation dark gray.
-const COL_PATH: Color = Color::Cyan;
-const COL_CMD: Color = Color::Yellow;
-const COL_KEY: Color = Color::Magenta;
-const COL_VAL: Color = Color::Green;
-const COL_PUNCT: Color = Color::DarkGray;
-
-/// Highlight a shell command line: `/system/eeprom print level=3` →
-/// path segments cyan, `/` separators dim, bare words yellow, `key=value` magenta/green.
-fn highlight_command(line: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (i, tok) in line.split_inclusive(' ').enumerate() {
-        let (word, trail) = match tok.strip_suffix(' ') {
-            Some(w) => (w, " "),
-            None => (tok, ""),
-        };
-        if word.is_empty() {
-            // collapsed runs of spaces
-        } else if word.contains('=') {
-            let (k, v) = word.split_once('=').unwrap();
-            spans.push(Span::styled(k.to_string(), Style::new().fg(COL_KEY)));
-            spans.push(Span::styled("=".to_string(), Style::new().fg(COL_PUNCT)));
-            spans.push(Span::styled(v.to_string(), Style::new().fg(COL_VAL)));
-        } else if word.contains('/') {
-            for part in word.split_inclusive('/') {
-                let (seg, sep) = match part.strip_suffix('/') {
-                    Some(sg) => (sg, "/"),
-                    None => (part, ""),
-                };
-                if !seg.is_empty() {
-                    spans.push(Span::styled(seg.to_string(), Style::new().fg(COL_PATH)));
-                }
-                if !sep.is_empty() {
-                    spans.push(Span::styled(sep.to_string(), Style::new().fg(COL_PUNCT)));
-                }
-            }
-        } else if i == 0 {
-            // First token without a slash: still an address into the tree.
-            spans.push(Span::styled(word.to_string(), Style::new().fg(COL_PATH)));
-        } else {
-            spans.push(Span::styled(word.to_string(), Style::new().fg(COL_CMD)));
-        }
-        if !trail.is_empty() {
-            spans.push(Span::raw(" "));
-        }
-    }
-    spans
-}
-
-/// Highlight a shell-response line: command-syntax lines (starting with `/`, e.g. `/export`
-/// output) reuse [`highlight_command`]; `key: value` / `key = value` lines split into a
-/// magenta key, dim separator, and green value; anything else renders raw.
-fn highlight_response(line: &str) -> Line<'static> {
-    let l = line;
-    if l.starts_with('/') {
-        return Line::from(highlight_command(l));
-    }
-    if l.starts_with('>') {
-        // The local echo of the command the user sent.
-        let mut spans = vec![Span::styled("> ".to_string(), Style::new().fg(COL_PUNCT))];
-        spans.extend(highlight_command(l.trim_start_matches("> ")));
-        return Line::from(spans);
-    }
-    for sep in [" = ", ": "] {
-        if let Some((k, v)) = l.split_once(sep) {
-            // Only treat it as key/value when the key looks like one (single-ish word).
-            if !k.is_empty() && k.len() <= 24 && !k.contains("  ") {
-                return Line::from(vec![
-                    Span::styled(k.to_string(), Style::new().fg(COL_KEY)),
-                    Span::styled(sep.to_string(), Style::new().fg(COL_PUNCT)),
-                    Span::styled(v.to_string(), Style::new().fg(COL_VAL)),
-                ]);
-            }
-        }
-    }
-    Line::raw(line.to_string())
-}
-
 /// The ratatui color a Log line is tinted with, by severity. (The label text itself comes
 /// from the shared `render::level_label` via `render::log_line`, so it can't drift.)
 fn level_color(l: Level) -> Color {

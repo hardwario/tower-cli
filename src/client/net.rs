@@ -84,7 +84,7 @@ fn status(opts: &MqttOpts, json: bool) -> Result<u8> {
                 "network:  {} node(s), {} uplink(s), {} queued downlink(s)",
                 st.nodes, st.uplinks, st.queued
             );
-            if let (Some(dbm), Some(ch)) = (st.rssi_dbm, st.channel) {
+            if let (Some(dbm), Some(ch)) = (st.rssi, st.channel) {
                 println!("radio:    ch {ch} ambient {dbm} dBm");
             }
         }

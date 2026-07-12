@@ -15,6 +15,7 @@
 
 pub(crate) mod engine;
 pub(crate) mod mqtt;
+pub(crate) mod pair;
 pub(crate) mod payload;
 pub(crate) mod serial;
 pub(crate) mod service;
@@ -232,7 +233,17 @@ pub(crate) fn run(port: Option<String>, opts: GatewayOpts) -> Result<u8> {
     }
 
     // ---- engine thread: state machine + output execution ----
+    // The TUI's cable-pairing worker provisions nodes toward THIS gateway — its
+    // network parameters come from the startup describe (boot-applied, can't drift).
+    let gw_params = pair::GwParams {
+        addr: info.addr,
+        band: info.band,
+        channel: info.channel,
+    };
     let mut engine = Engine::new(prefix.clone(), port.clone(), info);
+    // Random per-process dedup epoch: a fresh host must not be mistaken for a
+    // re-delivery a node already ran (the empty "checkmark" reply). See the note.
+    engine.randomize_shell_epoch();
     {
         let client = client.clone();
         std::thread::Builder::new()
@@ -249,6 +260,15 @@ pub(crate) fn run(port: Option<String>, opts: GatewayOpts) -> Result<u8> {
                                 payload,
                                 retain,
                             } => {
+                                // Mirror every publish to the frontend (the TUI's MQTT
+                                // feed) — the engine stays pure; the runner is the one
+                                // place that sees the whole broker-bound stream.
+                                let _ = event_tx.send(Event::Mqtt(engine::MqttMsg {
+                                    dir: engine::MqttDir::Out,
+                                    topic: topic.clone(),
+                                    payload: payload.clone(),
+                                    retain,
+                                }));
                                 let _ = client.publish(topic, QoS::AtLeastOnce, retain, payload);
                             }
                             Output::Subscribe(filter) => {
@@ -262,6 +282,15 @@ pub(crate) fn run(port: Option<String>, opts: GatewayOpts) -> Result<u8> {
                 };
                 execute(engine.start());
                 while let Ok(input) = input_rx.recv() {
+                    // Mirror inbound broker traffic too (client shell/req + RPCs).
+                    if let Input::MqttIn { topic, payload } = &input {
+                        let _ = event_tx.send(Event::Mqtt(engine::MqttMsg {
+                            dir: engine::MqttDir::In,
+                            topic: topic.clone(),
+                            payload: payload.clone(),
+                            retain: false,
+                        }));
+                    }
                     execute(engine.handle(input));
                 }
             })
@@ -273,7 +302,7 @@ pub(crate) fn run(port: Option<String>, opts: GatewayOpts) -> Result<u8> {
         service::run(event_rx);
         Ok(EXIT_OK)
     } else {
-        tui::run(event_rx, input_tx, prefix, port)
+        tui::run(event_rx, input_tx, prefix, port, gw_params)
     }
 }
 

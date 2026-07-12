@@ -53,7 +53,7 @@ pub(crate) enum NodesCmd {
     /// Run a remote shell command on a node (queued until it wakes).
     Shell {
         node: String,
-        /// The command line, e.g. "/system settings set temp-period=30".
+        /// The command line, e.g. "/system settings set therm-period=30".
         line: String,
         /// Queue TTL in seconds (0 = gateway default, 1 h).
         #[arg(long, value_name = "S", default_value_t = 0)]
@@ -235,10 +235,10 @@ fn print_table(nodes: &[Node]) {
             n.addr,
             if n.name.is_empty() { "—" } else { &n.name },
             if n.kind.is_empty() { "?" } else { &n.kind },
-            n.last_seen_s
+            n.last_seen
                 .map(|s| format!("{s}s"))
                 .unwrap_or_else(|| "never".into()),
-            n.rssi_dbm
+            n.rssi
                 .map(|r| format!("{r}dBm"))
                 .unwrap_or_else(|| "—".into()),
             n.uplinks,
@@ -253,7 +253,7 @@ fn add_ota(s: &mut Session, window: u16, name: Option<&str>) -> Result<u8> {
     // The RPC resolves when the window does (join / expiry), so give it the window
     // plus slack over the generic RPC timeout.
     let saved = std::mem::replace(&mut s.timeout, Duration::from_secs(window as u64 + 10));
-    let rsp = s.rpc("node_add_ota", serde_json::json!({ "window_s": window }));
+    let rsp = s.rpc("node_add_ota", serde_json::json!({ "window": window }));
     s.timeout = saved;
     let data = match rsp {
         Ok(r) if r.ok => r.data,
@@ -300,7 +300,7 @@ fn shell(
             serde_json::to_vec(&ShellReq {
                 id: req_id.clone(),
                 line: line.to_string(),
-                ttl_s: ttl,
+                ttl,
             })?,
         )
         .context("publishing the shell request")?;

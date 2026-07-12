@@ -45,7 +45,7 @@ pub(crate) enum SerialMsg {
     Uplink {
         src: u32,
         counter: u32,
-        rssi_dbm: i16,
+        rssi: i16,
         lqi: u8,
         data: Vec<u8>,
     },
@@ -122,6 +122,27 @@ pub(crate) enum Event {
     Pairing(payload::Pairing),
     /// The response to a frontend-initiated RPC (id prefixed "tui-").
     Rpc(RpcResponse),
+    /// One MQTT message crossed the broker link (mirrored by the runner — the
+    /// engine itself never emits this). TUI feed food; the service ignores it.
+    Mqtt(MqttMsg),
+}
+
+/// Which way an MQTT message crossed the link, seen from the gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MqttDir {
+    /// Published by this gateway.
+    Out,
+    /// Received from a broker subscription (`gateway/cmd`, `nodes/+/shell/req`).
+    In,
+}
+
+/// One mirrored MQTT message (the TUI's traffic-feed entry).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MqttMsg {
+    pub dir: MqttDir,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub retain: bool,
 }
 
 /// The frontend's view of one node (mirror row + live pendings).
@@ -132,8 +153,8 @@ pub(crate) struct NodeView {
     pub kind: String,
     pub sleeping: bool,
     pub unnamed: bool,
-    pub last_seen_s: Option<u32>,
-    pub rssi_dbm: Option<i8>,
+    pub last_seen: Option<u32>,
+    pub rssi: Option<i8>,
     pub uplinks: u32,
     pub queued: u8,
     pub pending: Vec<PendingEntry>,
@@ -143,7 +164,7 @@ pub(crate) struct NodeView {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RadioSample {
     Ambient { dbm: i16, channel: u8 },
-    Rx { src: u32, rssi_dbm: i16 },
+    Rx { src: u32, rssi: i16 },
     Tx { dest: u32, delivered: bool },
 }
 
@@ -236,6 +257,8 @@ pub(crate) struct Engine {
     seq: u16,
     next_req: u16,
     next_cmd: u16,
+    /// Per-process random dedup epoch stamped on every downlink shell command.
+    shell_epoch: u32,
     pending_mgmt: Vec<PendingMgmt>,
     nodes: Vec<NodeMirror>,
     pairing_rpc: Option<String>,
@@ -289,6 +312,7 @@ impl Engine {
             seq: 0,
             next_req: 1,
             next_cmd: 1,
+            shell_epoch: 0,
             pending_mgmt: Vec::new(),
             nodes: Vec::new(),
             pairing_rpc: None,
@@ -296,6 +320,22 @@ impl Engine {
             tick: 0,
             uplinks: 0,
             last_ambient: None,
+        }
+    }
+
+    /// Seed a fresh random per-process **shell dedup epoch**.
+    ///
+    /// The node de-duplicates the gateway's at-least-once re-deliveries on the
+    /// `(epoch, cmd_id)` pair, and its memory survives a host restart (the node
+    /// keeps running). Reusing a low `cmd_id` from a fresh host would otherwise be
+    /// mistaken for a re-delivery the node already ran — the "checkmark, no output"
+    /// bug. A 32-bit random epoch per `tower gateway` process makes that collision
+    /// ~2⁻³² (a fresh host would have to draw the previous process's exact epoch AND
+    /// reuse its `cmd_id`). Production only; tests keep the deterministic epoch 0.
+    pub(crate) fn randomize_shell_epoch(&mut self) {
+        let mut b = [0u8; 4];
+        if getrandom::fill(&mut b).is_ok() {
+            self.shell_epoch = u32::from_le_bytes(b);
         }
     }
 
@@ -411,21 +451,18 @@ impl Engine {
             SerialMsg::Uplink {
                 src,
                 counter,
-                rssi_dbm,
+                rssi,
                 lqi,
                 data,
             } => {
                 self.uplinks += 1;
-                self.touch_node(src, rssi_dbm);
-                out.push(Output::Event(Event::Radio(RadioSample::Rx {
-                    src,
-                    rssi_dbm,
-                })));
+                self.touch_node(src, rssi);
+                out.push(Output::Event(Event::Radio(RadioSample::Rx { src, rssi })));
                 out.push(Output::Publish {
                     topic: topics::radio_rx(&self.prefix),
                     payload: json(&payload::RadioRx {
                         src: topics::node_hex(src),
-                        rssi_dbm,
+                        rssi,
                         lqi,
                         len: data.len(),
                         ts: now_ts(),
@@ -436,7 +473,7 @@ impl Engine {
                     topic: topics::node_uplink(&self.prefix, src),
                     payload: json(&payload::UplinkDebug {
                         counter,
-                        rssi_dbm,
+                        rssi,
                         lqi,
                         len: data.len(),
                         hex: data.iter().map(|b| format!("{b:02x}")).collect(),
@@ -629,16 +666,16 @@ impl Engine {
     fn on_radio_stat(&mut self, stat: RadioStat, out: &mut Vec<Output>) {
         let ts = now_ts();
         match stat {
-            RadioStat::Channel { channel, rssi_dbm } => {
-                self.last_ambient = Some((rssi_dbm, channel));
+            RadioStat::Channel { channel, rssi } => {
+                self.last_ambient = Some((rssi, channel));
                 out.push(Output::Event(Event::Radio(RadioSample::Ambient {
-                    dbm: rssi_dbm,
+                    dbm: rssi,
                     channel,
                 })));
                 out.push(Output::Publish {
                     topic: topics::radio_rssi(&self.prefix),
                     payload: json(&payload::RadioRssi {
-                        dbm: rssi_dbm,
+                        dbm: rssi,
                         channel,
                         ts,
                     }),
@@ -649,7 +686,7 @@ impl Engine {
                 dest,
                 item,
                 outcome,
-                ack_rssi_dbm,
+                ack_rssi,
             } => {
                 out.push(Output::Event(Event::Radio(RadioSample::Tx {
                     dest,
@@ -661,7 +698,7 @@ impl Engine {
                         dest: topics::node_hex(dest),
                         item,
                         outcome: payload::tx_outcome_str(outcome).into(),
-                        ack_rssi_dbm,
+                        ack_rssi,
                         ts,
                     }),
                     retain: false,
@@ -842,8 +879,8 @@ impl Engine {
                         serde_json::json!({
                             "addr": topics::node_hex(e.node_addr),
                             "ref": e.item,
-                            "age_s": e.age_s,
-                            "ttl_s": e.ttl_s,
+                            "age": e.age,
+                            "ttl": e.ttl,
                         })
                     })
                     .collect();
@@ -971,6 +1008,7 @@ impl Engine {
         let mut env = [0u8; radio::MAX_RADIO_PAYLOAD];
         let Ok(n) = radio::encode_node_cmd(
             &NodeCmd::Shell {
+                epoch: self.shell_epoch,
                 cmd_id,
                 line: &req.line,
             },
@@ -987,7 +1025,7 @@ impl Engine {
         // The borrow-carrying op is encoded immediately by `issue`.
         let op = MgmtOp::QueuePush {
             node_addr: node,
-            ttl_s: req.ttl_s,
+            ttl: req.ttl,
             data: &data,
         };
         self.issue(
@@ -1113,8 +1151,8 @@ impl Engine {
                 if self.pairing_rpc.is_some() {
                     return self.rpc_err_direct(out, &req.id, "a pairing window is already open");
                 }
-                let window_s = params
-                    .get("window_s")
+                let window = params
+                    .get("window")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(60)
                     .clamp(1, 600) as u16;
@@ -1124,14 +1162,14 @@ impl Engine {
                     return self.rpc_err_direct(out, &req.id, "no entropy source for the node key");
                 }
                 self.pairing_rpc = Some(req.id.clone());
-                self.pairing_until = Some(self.tick + window_s as u64);
+                self.pairing_until = Some(self.tick + window as u64);
                 self.publish_pairing(out, None);
                 self.issue_delayed(
                     out,
                     OpKind::PairingOpen,
-                    MgmtOp::PairingOpen { window_s, key },
+                    MgmtOp::PairingOpen { window, key },
                     rpc,
-                    window_s as u64 + 5,
+                    window as u64 + 5,
                 );
             }
             "pairing_cancel" => {
@@ -1400,10 +1438,10 @@ impl Engine {
 
     /// Refresh a node's RAM-side liveliness on an uplink (the device tracks this too;
     /// mirroring it keeps the TUI live without polling NodeList).
-    fn touch_node(&mut self, id: u32, rssi_dbm: i16) {
+    fn touch_node(&mut self, id: u32, rssi: i16) {
         if let Some(n) = self.nodes.iter_mut().find(|n| n.entry.addr == id) {
-            n.entry.last_seen_s = 0;
-            n.entry.rssi_dbm = rssi_dbm.clamp(i8::MIN as i16, i8::MAX as i16) as i8;
+            n.entry.last_seen = 0;
+            n.entry.rssi = rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8;
             n.entry.uplinks = n.entry.uplinks.saturating_add(1);
         }
     }
@@ -1417,9 +1455,9 @@ impl Engine {
                 kind: n.kind.clone(),
                 sleeping: n.entry.flags & mgmt::NODE_FLAG_SLEEPING != 0,
                 unnamed: n.entry.flags & mgmt::NODE_FLAG_UNNAMED != 0,
-                last_seen_s: (n.entry.last_seen_s != mgmt::LAST_SEEN_NEVER)
-                    .then_some(n.entry.last_seen_s),
-                rssi_dbm: (n.entry.rssi_dbm != mgmt::RSSI_NONE).then_some(n.entry.rssi_dbm),
+                last_seen: (n.entry.last_seen != mgmt::LAST_SEEN_NEVER)
+                    .then_some(n.entry.last_seen),
+                rssi: (n.entry.rssi != mgmt::RSSI_NONE).then_some(n.entry.rssi),
                 uplinks: n.entry.uplinks,
                 queued: n.entry.queued.max(n.pending.len() as u8),
             })
@@ -1463,9 +1501,9 @@ impl Engine {
                 kind: n.kind.clone(),
                 sleeping: n.entry.flags & mgmt::NODE_FLAG_SLEEPING != 0,
                 unnamed: n.entry.flags & mgmt::NODE_FLAG_UNNAMED != 0,
-                last_seen_s: (n.entry.last_seen_s != mgmt::LAST_SEEN_NEVER)
-                    .then_some(n.entry.last_seen_s),
-                rssi_dbm: (n.entry.rssi_dbm != mgmt::RSSI_NONE).then_some(n.entry.rssi_dbm),
+                last_seen: (n.entry.last_seen != mgmt::LAST_SEEN_NEVER)
+                    .then_some(n.entry.last_seen),
+                rssi: (n.entry.rssi != mgmt::RSSI_NONE).then_some(n.entry.rssi),
                 uplinks: n.entry.uplinks,
                 queued: n.entry.queued.max(n.pending.len() as u8),
                 pending: n
@@ -1505,11 +1543,11 @@ impl Engine {
         out.push(Output::Publish {
             topic: topics::gateway_stats(&self.prefix),
             payload: json(&payload::Stats {
-                uptime_s: self.tick,
+                uptime: self.tick,
                 nodes: self.nodes.len() as u32,
                 uplinks: self.uplinks,
                 queued: self.nodes.iter().map(|n| n.pending.len() as u32).sum(),
-                rssi_dbm: self.last_ambient.map(|(d, _)| d),
+                rssi: self.last_ambient.map(|(d, _)| d),
                 channel: self.last_ambient.map(|(_, c)| c),
             }),
             retain: true,
@@ -1520,7 +1558,7 @@ impl Engine {
         let open = self.pairing_until.is_some();
         let p = payload::Pairing {
             state: if open { "open" } else { "idle" }.into(),
-            remaining_s: self.pairing_until.map(|u| u.saturating_sub(self.tick)),
+            remaining: self.pairing_until.map(|u| u.saturating_sub(self.tick)),
             joined,
         };
         out.push(Output::Publish {
@@ -1537,6 +1575,21 @@ mod tests {
     use super::*;
     use tower_protocol::mgmt::{DeviceRole, MGMT_OK, NODE_FLAG_SLEEPING, NODE_FLAG_UNNAMED};
     use tower_protocol::{MsgType, decode_frame};
+
+    #[test]
+    fn randomize_shell_epoch_moves_off_the_default() {
+        // Cross-restart dedup fix: production stamps a random 32-bit epoch on every
+        // downlink shell command, so a fresh host reusing low cmd_ids is not mistaken
+        // for a re-delivery the node already ran.
+        let mut e = engine();
+        assert_eq!(e.shell_epoch, 0, "tests keep the deterministic epoch");
+        let mut moved = false;
+        for _ in 0..4 {
+            e.randomize_shell_epoch();
+            moved |= e.shell_epoch != 0;
+        }
+        assert!(moved, "a random epoch should differ from 0");
+    }
 
     fn engine() -> Engine {
         Engine::new(
@@ -1601,8 +1654,8 @@ mod tests {
             addr: id,
             name,
             flags,
-            last_seen_s: 3,
-            rssi_dbm: -60,
+            last_seen: 3,
+            rssi: -60,
             uplinks: 5,
             queued: 0,
         })
@@ -1682,7 +1735,7 @@ mod tests {
         let out = e.handle(Input::SerialFrame(SerialMsg::Uplink {
             src: 0xAB12,
             counter: 42,
-            rssi_dbm: -67,
+            rssi: -67,
             lqi: 30,
             data: env[..n].to_vec(),
         }));
@@ -1713,7 +1766,7 @@ mod tests {
         let out = e.handle(Input::SerialFrame(SerialMsg::Uplink {
             src: 0xAB12,
             counter: 1,
-            rssi_dbm: -60,
+            rssi: -60,
             lqi: 30,
             data: env[..n].to_vec(),
         }));
@@ -1732,7 +1785,7 @@ mod tests {
             payload: serde_json::to_vec(&payload::ShellReq {
                 id: "u-1".into(),
                 line: "/led on".into(),
-                ttl_s: 0,
+                ttl: 0,
             })
             .unwrap(),
         });
@@ -1763,7 +1816,7 @@ mod tests {
         let out = e.handle(Input::SerialFrame(SerialMsg::Uplink {
             src: 0xAB12,
             counter: 2,
-            rssi_dbm: -60,
+            rssi: -60,
             lqi: 30,
             data: env[..n].to_vec(),
         }));
@@ -1856,7 +1909,7 @@ mod tests {
         let mut e = engine();
         let out = e.handle(Input::SerialFrame(SerialMsg::Stat(RadioStat::Channel {
             channel: 0,
-            rssi_dbm: -98,
+            rssi: -98,
         })));
         assert!(!publishes(&out, "tower/radio/rssi").is_empty());
         assert!(out.iter().any(|o| matches!(
@@ -1905,7 +1958,7 @@ mod tests {
         e.handle(Input::SerialFrame(SerialMsg::Uplink {
             src,
             counter: chunk as u32,
-            rssi_dbm: -60,
+            rssi: -60,
             lqi: 30,
             data: env[..n].to_vec(),
         }))
@@ -1975,7 +2028,7 @@ mod tests {
             dest: 0xAB12,
             item: 9,
             outcome: mgmt::TX_EXPIRED,
-            ack_rssi_dbm: None,
+            ack_rssi: None,
         })));
         let rsp = last_shell_rsp(&out);
         assert!(rsp.done);
@@ -2002,7 +2055,7 @@ mod tests {
             dest: 0xAB12,
             item: 9,
             outcome: mgmt::TX_DELIVERED,
-            ack_rssi_dbm: Some(-50),
+            ack_rssi: Some(-50),
         })));
         assert!(
             publishes(&out, "tower/nodes/0x0000ab12/shell/rsp").is_empty(),
@@ -2088,7 +2141,7 @@ mod tests {
         let mut e = engine();
         let out = e.handle(Input::MqttIn {
             topic: "tower/gateway/cmd".into(),
-            payload: br#"{"id":"u-ota","op":"node_add_ota","params":{"window_s":5}}"#.to_vec(),
+            payload: br#"{"id":"u-ota","op":"node_add_ota","params":{"window":5}}"#.to_vec(),
         });
         let (req_id, op) = out.iter().find_map(sent_op).expect("PairingOpen issued");
         assert!(op.contains("PairingOpen"), "{op}");
@@ -2113,7 +2166,7 @@ mod tests {
         let out = e.handle(Input::SerialFrame(SerialMsg::Uplink {
             src: 0xAB12,
             counter: 3,
-            rssi_dbm: -60,
+            rssi: -60,
             lqi: 30,
             data: env[..n].to_vec(),
         }));
@@ -2144,7 +2197,7 @@ mod tests {
         let out = e.handle(Input::SerialFrame(SerialMsg::Uplink {
             src: 0xAB12,
             counter: 4,
-            rssi_dbm: -60,
+            rssi: -60,
             lqi: 30,
             data: env[..n].to_vec(),
         }));

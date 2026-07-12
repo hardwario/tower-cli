@@ -110,13 +110,13 @@ fn dispatch(cmd: NodesCmd, opts: &MqttOpts) -> Result<u8> {
         NodesCmd::Show { node, keys, json } => {
             let id = s.resolve_node(&node)?;
             let nodes = node_list(&mut s)?;
-            let Some(n) = nodes.iter().find(|n| n.id == topics::node_hex(id)) else {
+            let Some(n) = nodes.iter().find(|n| n.addr == topics::node_hex(id)) else {
                 bail!("node vanished from the registry");
             };
             let key = if keys {
                 let data = s.rpc_ok(
                     "reveal_key",
-                    serde_json::json!({ "node": topics::node_hex(id) }),
+                    serde_json::json!({ "addr": topics::node_hex(id) }),
                 )?;
                 data.get("key").and_then(|v| v.as_str()).map(String::from)
             } else {
@@ -154,7 +154,7 @@ fn dispatch(cmd: NodesCmd, opts: &MqttOpts) -> Result<u8> {
             let id = s.resolve_node(&node)?;
             s.rpc_ok(
                 "node_remove",
-                serde_json::json!({ "node": topics::node_hex(id) }),
+                serde_json::json!({ "addr": topics::node_hex(id) }),
             )?;
             println!("removed {}", topics::node_hex(id));
             Ok(EXIT_OK)
@@ -163,7 +163,7 @@ fn dispatch(cmd: NodesCmd, opts: &MqttOpts) -> Result<u8> {
             let id = s.resolve_node(&node)?;
             s.rpc_ok(
                 "node_rename",
-                serde_json::json!({ "node": topics::node_hex(id), "name": name }),
+                serde_json::json!({ "addr": topics::node_hex(id), "name": name }),
             )?;
             println!("renamed {} to \"{name}\"", topics::node_hex(id));
             Ok(EXIT_OK)
@@ -207,7 +207,7 @@ fn dispatch(cmd: NodesCmd, opts: &MqttOpts) -> Result<u8> {
             let id = s.resolve_node(&node)?;
             s.rpc_ok(
                 "queue_drop",
-                serde_json::json!({ "node": topics::node_hex(id), "ref": r#ref }),
+                serde_json::json!({ "addr": topics::node_hex(id), "ref": r#ref }),
             )?;
             println!("dequeued #{ref}", ref = r#ref);
             Ok(EXIT_OK)
@@ -232,7 +232,7 @@ fn print_table(nodes: &[Node]) {
     for n in nodes {
         println!(
             "{:<12} {:<16} {:<12} {:>9} {:>6} {:>8} {:>5} {:<5}",
-            n.id,
+            n.addr,
             if n.name.is_empty() { "—" } else { &n.name },
             if n.kind.is_empty() { "?" } else { &n.kind },
             n.last_seen_s
@@ -264,7 +264,7 @@ fn add_ota(s: &mut Session, window: u16, name: Option<&str>) -> Result<u8> {
         Some(hex) => {
             println!("paired {hex}");
             if let Some(n) = name {
-                s.rpc_ok("node_rename", serde_json::json!({ "node": hex, "name": n }))?;
+                s.rpc_ok("node_rename", serde_json::json!({ "addr": hex, "name": n }))?;
                 println!("named \"{n}\"");
             }
             Ok(EXIT_OK)

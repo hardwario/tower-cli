@@ -8,7 +8,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Version of this topic/payload tree, carried in the retained `gateway/status`.
-pub(crate) const SCHEMA: u32 = 1;
+/// Bumped 1→2 when the radio-address terminology was unified (`nodes` payload key
+/// `id`→`addr`; RPC node-address param `id`/`node`→`addr`).
+pub(crate) const SCHEMA: u32 = 2;
 
 /// `gateway/status` (retained). The LWT publishes only `{state:"offline", schema}` —
 /// the broker can't know the rest once we're gone — so every other field is
@@ -61,10 +63,10 @@ pub(crate) struct Pairing {
     pub joined: Option<String>,
 }
 
-/// `nodes/{id}` (retained; an empty MQTT payload — not JSON — clears a removed node).
+/// `nodes/{addr}` (retained; an empty MQTT payload — not JSON — clears a removed node).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct Node {
-    pub id: String,
+    pub addr: String,
     pub name: String,
     /// Device kind derived from the node's reported firmware name (e.g. `push-button`);
     /// empty until the first `NodeInfo` heartbeat.
@@ -80,7 +82,7 @@ pub(crate) struct Node {
     pub queued: u8,
 }
 
-/// `nodes/{id}/event/button`.
+/// `nodes/{addr}/event/button`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct ButtonEvent {
     /// `press` | `release` | `click` | `hold`.
@@ -92,7 +94,7 @@ pub(crate) struct ButtonEvent {
     pub ts: u64,
 }
 
-/// `nodes/{id}/event/accel`.
+/// `nodes/{addr}/event/accel`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct AccelEvent {
     /// `motion` | `orientation`.
@@ -103,7 +105,7 @@ pub(crate) struct AccelEvent {
     pub ts: u64,
 }
 
-/// `nodes/{id}/measure/temperature` (retained last value).
+/// `nodes/{addr}/measure/temperature` (retained last value).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct Temperature {
     pub celsius: f64,
@@ -111,7 +113,7 @@ pub(crate) struct Temperature {
     pub ts: u64,
 }
 
-/// `nodes/{id}/uplink` — the raw decoded envelope (debug feed).
+/// `nodes/{addr}/uplink` — the raw decoded envelope (debug feed).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct UplinkDebug {
     pub counter: u32,
@@ -122,7 +124,7 @@ pub(crate) struct UplinkDebug {
     pub ts: u64,
 }
 
-/// `nodes/{id}/shell/req` (client → gateway): enqueue one remote-shell line.
+/// `nodes/{addr}/shell/req` (client → gateway): enqueue one remote-shell line.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct ShellReq {
     /// Client-minted correlation id (uuid) echoed in every `ShellRsp` chunk.
@@ -133,7 +135,7 @@ pub(crate) struct ShellReq {
     pub ttl_s: u16,
 }
 
-/// `nodes/{id}/shell/rsp` (gateway → clients): one response chunk.
+/// `nodes/{addr}/shell/rsp` (gateway → clients): one response chunk.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct ShellRsp {
     pub id: String,
@@ -150,7 +152,7 @@ pub(crate) struct ShellRsp {
     pub error: Option<String>,
 }
 
-/// One entry of `nodes/{id}/shell/pending` (retained; whole queue mirrored per node).
+/// One entry of `nodes/{addr}/shell/pending` (retained; whole queue mirrored per node).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct PendingEntry {
     /// The gateway's queue item id — the `nodes dequeue` handle.
@@ -260,7 +262,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
-            r#"{"state":"online","schema":1,"gateway":"0x0000ab12","firmware":"radio_dongle_gateway","firmware_version":"v0.1.0","session_id":7,"protocol":3,"serial_port":"/dev/ttyACM0","serial_up":true}"#
+            r#"{"state":"online","schema":2,"gateway":"0x0000ab12","firmware":"radio_dongle_gateway","firmware_version":"v0.1.0","session_id":7,"protocol":3,"serial_port":"/dev/ttyACM0","serial_up":true}"#
         );
     }
 
@@ -281,7 +283,7 @@ mod tests {
     #[test]
     fn golden_node() {
         let n = Node {
-            id: "0x0000ab12".into(),
+            addr: "0x0000ab12".into(),
             name: "kitchen".into(),
             kind: "push-button".into(),
             sleeping: true,
@@ -293,7 +295,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&n).unwrap(),
-            r#"{"id":"0x0000ab12","name":"kitchen","kind":"push-button","sleeping":true,"unnamed":false,"last_seen_s":3,"rssi_dbm":-67,"uplinks":12,"queued":1}"#
+            r#"{"addr":"0x0000ab12","name":"kitchen","kind":"push-button","sleeping":true,"unnamed":false,"last_seen_s":3,"rssi_dbm":-67,"uplinks":12,"queued":1}"#
         );
     }
 

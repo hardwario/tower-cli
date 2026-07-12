@@ -29,7 +29,7 @@ pub(crate) fn run(events: Receiver<Event>) {
                     .map(|n| format!(
                         " · {}",
                         if n.name.is_empty() {
-                            n.id.to_string()
+                            n.addr.to_string()
                         } else {
                             n.name.clone()
                         }

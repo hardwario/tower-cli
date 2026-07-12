@@ -158,18 +158,18 @@ impl App {
             }
             Event::Registry(nodes) => {
                 // Keep selection/dialog anchored to the same node across refreshes.
-                let sel_id = self.selected_node().map(|n| n.id);
-                let dlg_id = self.shell_target().map(|n| n.id);
+                let sel_id = self.selected_node().map(|n| n.addr);
+                let dlg_id = self.shell_target().map(|n| n.addr);
                 self.nodes = nodes;
                 if let Some(id) = sel_id
-                    && let Some(i) = self.nodes.iter().position(|n| n.id == id)
+                    && let Some(i) = self.nodes.iter().position(|n| n.addr == id)
                 {
                     self.selected = i;
                 } else {
                     self.selected = self.selected.min(self.nodes.len().saturating_sub(1));
                 }
                 if let Some(id) = dlg_id
-                    && let Some(i) = self.nodes.iter().position(|n| n.id == id)
+                    && let Some(i) = self.nodes.iter().position(|n| n.addr == id)
                 {
                     self.shell_node = i;
                 } else {
@@ -235,7 +235,7 @@ impl App {
                     // A reveal answered — swap the confirm modal for the key view.
                     let node = rsp
                         .data
-                        .get("node")
+                        .get("addr")
                         .and_then(|v| v.as_str())
                         .and_then(topics::parse_node_hex)
                         .unwrap_or(0);
@@ -364,26 +364,26 @@ fn handle_nodes_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Delete | KeyCode::Char('x') => {
             if let Some(n) = app.selected_node() {
-                app.modal = Some(Modal::ConfirmRemove(n.id));
+                app.modal = Some(Modal::ConfirmRemove(n.addr));
             }
         }
         KeyCode::F(6) | KeyCode::Char('r') => {
             if let Some(n) = app.selected_node() {
                 app.modal = Some(Modal::Rename {
-                    node: n.id,
+                    node: n.addr,
                     buf: n.name.clone(),
                 });
             }
         }
         KeyCode::F(4) | KeyCode::Char('k') => {
             if let Some(n) = app.selected_node() {
-                app.modal = Some(Modal::ConfirmReveal(n.id));
+                app.modal = Some(Modal::ConfirmReveal(n.addr));
             }
         }
         KeyCode::Char('p') => {
             if let Some(n) = app.selected_node() {
                 app.modal = Some(Modal::Pending {
-                    node: n.id,
+                    node: n.addr,
                     selected: 0,
                 });
             }
@@ -476,7 +476,7 @@ fn submit_line(app: &mut App) {
     if line.is_empty() {
         return;
     }
-    let Some(target) = app.shell_target().map(|n| n.id) else {
+    let Some(target) = app.shell_target().map(|n| n.addr) else {
         app.push_log("no node selected — pair one first (F2)".into());
         return;
     };
@@ -505,7 +505,7 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
             KeyCode::Enter | KeyCode::Char('y') => {
                 app.rpc(
                     "node_remove",
-                    serde_json::json!({ "node": topics::node_hex(node) }),
+                    serde_json::json!({ "addr": topics::node_hex(node) }),
                 );
             }
             _ => {}
@@ -515,7 +515,7 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
                 if !buf.is_empty() {
                     app.rpc(
                         "node_rename",
-                        serde_json::json!({ "node": topics::node_hex(node), "name": buf }),
+                        serde_json::json!({ "addr": topics::node_hex(node), "name": buf }),
                     );
                 }
             }
@@ -534,7 +534,7 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
             KeyCode::Enter | KeyCode::Char('y') => {
                 app.rpc(
                     "reveal_key",
-                    serde_json::json!({ "node": topics::node_hex(node) }),
+                    serde_json::json!({ "addr": topics::node_hex(node) }),
                 );
                 // The Key modal opens when the RPC answers (Event::Rpc).
             }
@@ -552,7 +552,7 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
             let count = app
                 .nodes
                 .iter()
-                .find(|n| n.id == node)
+                .find(|n| n.addr == node)
                 .map(|n| n.pending.len())
                 .unwrap_or(0);
             match code {
@@ -572,13 +572,13 @@ fn handle_modal_key(app: &mut App, code: KeyCode) {
                     if let Some(entry) = app
                         .nodes
                         .iter()
-                        .find(|n| n.id == node)
+                        .find(|n| n.addr == node)
                         .and_then(|n| n.pending.get(selected))
                     {
                         let r = entry.r#ref;
                         app.rpc(
                             "queue_drop",
-                            serde_json::json!({ "node": topics::node_hex(node), "ref": r }),
+                            serde_json::json!({ "addr": topics::node_hex(node), "ref": r }),
                         );
                     }
                     app.modal = Some(Modal::Pending { node, selected });
@@ -707,7 +707,7 @@ fn render_nodes(f: &mut Frame, app: &App, area: Rect) {
                 Style::new()
             };
             Row::new(vec![
-                topics::node_hex(n.id),
+                topics::node_hex(n.addr),
                 if n.name.is_empty() {
                     "—".into()
                 } else {
@@ -808,25 +808,25 @@ fn render_chart(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_shell(f: &mut Frame, app: &App, area: Rect) {
-    let (title, node_id) = match app.shell_target() {
+    let (title, node_addr) = match app.shell_target() {
         Some(n) => (
             format!(
                 " Shell: {} ‹{}/{}› ",
                 if n.name.is_empty() {
-                    topics::node_hex(n.id)
+                    topics::node_hex(n.addr)
                 } else {
                     n.name.clone()
                 },
                 app.shell_node + 1,
                 app.nodes.len()
             ),
-            Some(n.id),
+            Some(n.addr),
         ),
         None => (" Shell (no nodes) ".to_string(), None),
     };
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(id) = node_id {
-        if let Some(d) = app.dialogs.get(&id) {
+    if let Some(addr) = node_addr {
+        if let Some(d) = app.dialogs.get(&addr) {
             for l in d {
                 lines.push(match l {
                     DialogLine::Sent(s) => Line::from(vec![
@@ -846,7 +846,7 @@ fn render_shell(f: &mut Frame, app: &App, area: Rect) {
             }
         }
         // Queue state: every still-pending command as a ⌛ line above the prompt.
-        if let Some(n) = app.nodes.iter().find(|n| n.id == id) {
+        if let Some(n) = app.nodes.iter().find(|n| n.addr == addr) {
             for p in &n.pending {
                 lines.push(Line::from(Span::styled(
                     format!("⌛ {} (ref {} — p→Del dequeues)", p.line, p.r#ref),
@@ -981,7 +981,7 @@ fn render_modal(f: &mut Frame, app: &App, body: Rect) {
             let pend = app
                 .nodes
                 .iter()
-                .find(|n| n.id == *node)
+                .find(|n| n.addr == *node)
                 .map(|n| n.pending.as_slice())
                 .unwrap_or(&[]);
             if pend.is_empty() {
@@ -1072,7 +1072,7 @@ mod tests {
 
     fn node(id: u32, name: &str, pending: usize) -> NodeView {
         NodeView {
-            id,
+            addr: id,
             name: name.into(),
             kind: "push-button".into(),
             sleeping: true,
@@ -1153,7 +1153,7 @@ mod tests {
             id: "tui-1".into(),
             ok: true,
             error: None,
-            data: serde_json::json!({ "node": "0x0000ab12", "key": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf" }),
+            data: serde_json::json!({ "addr": "0x0000ab12", "key": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf" }),
         }));
         let grid = render(&mut app);
         assert!(grid.contains("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"));

@@ -164,7 +164,7 @@ pub(crate) fn run(port: Option<String>, opts: GatewayOpts) -> Result<u8> {
     };
     eprintln!(
         "[tower] gateway {} on {port} ({} of {} node slots)",
-        topics::node_hex(info.net_id),
+        topics::node_hex(info.addr),
         info.node_count,
         info.node_capacity
     );
@@ -195,7 +195,7 @@ pub(crate) fn run(port: Option<String>, opts: GatewayOpts) -> Result<u8> {
         port: mqtt_port,
         username: opts.mqtt_user.clone(),
         password: opts.mqtt_password.clone(),
-        client_id: format!("tower-gateway-{}", topics::node_hex(info.net_id)),
+        client_id: format!("tower-gateway-{}", topics::node_hex(info.addr)),
     };
     let (client, connection) = mqtt::client(&params, &prefix);
 
@@ -332,13 +332,13 @@ mod tests {
         postcard::to_stdvec(&DeviceInfo {
             role,
             radio_schema_version: 1,
-            net_id: 0xAB12,
+            addr: 0xAB12,
             band: 0,
             channel: 0,
             node_capacity: 32,
             node_count: 0,
             provisioned: true,
-            gw_id: 0xAB12,
+            gw_addr: 0xAB12,
             firmware_name: "radio_push_button",
         })
         .unwrap()
@@ -426,7 +426,7 @@ mod tests {
         match gate_scripted(MGMT_OK, &device_info(DeviceRole::Gateway)) {
             GateDecision::Accept(info) => {
                 assert_eq!(info.role, DeviceRole::Gateway);
-                assert_eq!(info.net_id, 0xAB12);
+                assert_eq!(info.addr, 0xAB12);
             }
             _ => panic!("a gateway must be accepted"),
         }

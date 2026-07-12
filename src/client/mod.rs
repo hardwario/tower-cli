@@ -205,7 +205,7 @@ impl Session {
         let nodes: Vec<crate::gateway::payload::Node> = serde_json::from_value(data)?;
         for n in &nodes {
             if n.name == arg
-                && let Some(id) = topics::parse_node_hex(&n.id)
+                && let Some(id) = topics::parse_node_hex(&n.addr)
             {
                 return Ok(id);
             }
@@ -215,7 +215,7 @@ impl Session {
             nodes
                 .iter()
                 .map(|n| if n.name.is_empty() {
-                    n.id.clone()
+                    n.addr.clone()
                 } else {
                     n.name.clone()
                 })

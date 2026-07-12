@@ -127,7 +127,7 @@ pub(crate) enum Event {
 /// The frontend's view of one node (mirror row + live pendings).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NodeView {
-    pub id: u32,
+    pub addr: u32,
     pub name: String,
     pub kind: String,
     pub sleeping: bool,
@@ -308,7 +308,7 @@ impl Engine {
         self.issue(&mut out, OpKind::NodeList, MgmtOp::NodeList, None);
         out.push(Output::Event(Event::Log(format!(
             "gateway {} on {} ({} node slots)",
-            topics::node_hex(self.describe.net_id),
+            topics::node_hex(self.describe.addr),
             self.port_name,
             self.describe.node_capacity
         ))));
@@ -396,7 +396,7 @@ impl Engine {
                     // The RAM queue died with the old session: fail every pending
                     // command loudly, then resync the registry.
                     for i in 0..self.nodes.len() {
-                        let node = self.nodes[i].entry.id;
+                        let node = self.nodes[i].entry.addr;
                         for p in std::mem::take(&mut self.nodes[i].pending) {
                             self.shell_error(out, node, &p, "gateway rebooted — command lost");
                         }
@@ -536,7 +536,7 @@ impl Engine {
     /// firmware never interprets payloads).
     fn on_node_info(&mut self, src: u32, info: &radio::NodeInfo<'_>, out: &mut Vec<Output>) {
         let kind = kind_of(info.firmware_name);
-        let Some(i) = self.nodes.iter().position(|n| n.entry.id == src) else {
+        let Some(i) = self.nodes.iter().position(|n| n.entry.addr == src) else {
             return; // unregistered node — forwarded but not ours to manage
         };
         self.nodes[i].kind = kind.clone();
@@ -562,14 +562,14 @@ impl Engine {
             ))));
             // `op` borrows the local; `issue` encodes it immediately, so no leak/copy.
             let op = MgmtOp::NodeUpdate {
-                id: src,
+                addr: src,
                 name: Some(name.as_str()),
                 flags: Some(flags),
             };
             self.issue(out, OpKind::NodeUpdate, op, None);
         } else if flags != self.nodes[i].entry.flags {
             let op = MgmtOp::NodeUpdate {
-                id: src,
+                addr: src,
                 name: None,
                 flags: Some(flags),
             };
@@ -585,7 +585,7 @@ impl Engine {
         chunk: &radio::NodeShellChunk<'_>,
         out: &mut Vec<Output>,
     ) {
-        let Some(i) = self.nodes.iter().position(|n| n.entry.id == src) else {
+        let Some(i) = self.nodes.iter().position(|n| n.entry.addr == src) else {
             return;
         };
         let Some(pi) = self.nodes[i]
@@ -675,7 +675,7 @@ impl Engine {
 
     /// A queue item left the gateway (delivered) or died (expired / kept for retry).
     fn on_queue_outcome(&mut self, node: u32, item: u16, outcome: u8, out: &mut Vec<Output>) {
-        let Some(i) = self.nodes.iter().position(|n| n.entry.id == node) else {
+        let Some(i) = self.nodes.iter().position(|n| n.entry.addr == node) else {
             return;
         };
         match outcome {
@@ -739,7 +739,7 @@ impl Engine {
                 self.rpc_ok(
                     out,
                     &p,
-                    serde_json::json!({ "gateway": topics::node_hex(self.describe.net_id) }),
+                    serde_json::json!({ "gateway": topics::node_hex(self.describe.addr) }),
                 );
             }
             (OpKind::NodeList, None) => {
@@ -759,7 +759,7 @@ impl Engine {
             }
             (OpKind::NodeRemove { id }, None) => {
                 let id = *id;
-                if let Some(i) = self.nodes.iter().position(|n| n.entry.id == id) {
+                if let Some(i) = self.nodes.iter().position(|n| n.entry.addr == id) {
                     for pd in std::mem::take(&mut self.nodes[i].pending) {
                         self.shell_error(out, id, &pd, "node removed");
                     }
@@ -790,7 +790,7 @@ impl Engine {
                     self.rpc_ok(
                         out,
                         &p,
-                        serde_json::json!({ "node": topics::node_hex(*id), "key": hex }),
+                        serde_json::json!({ "addr": topics::node_hex(*id), "key": hex }),
                     );
                 }
                 Err(_) => self.rpc_err(out, &p, "malformed key record"),
@@ -800,7 +800,7 @@ impl Engine {
                 self.pairing_rpc = None;
                 self.pairing_until = None;
                 let joined = postcard::from_bytes::<Paired>(&p.data).ok();
-                let hex = joined.map(|j| topics::node_hex(j.node_id));
+                let hex = joined.map(|j| topics::node_hex(j.addr));
                 out.push(Output::Event(Event::Log(match &hex {
                     Some(h) => format!("node {h} paired"),
                     None => "pairing window resolved".into(),
@@ -815,7 +815,7 @@ impl Engine {
                 match postcard::from_bytes::<QueueId>(&p.data) {
                     Ok(qid) => {
                         if let Some(origin) = shell
-                            && let Some(i) = self.nodes.iter().position(|n| n.entry.id == node)
+                            && let Some(i) = self.nodes.iter().position(|n| n.entry.addr == node)
                         {
                             self.nodes[i].pending.push(PendingShell {
                                 item: qid.item,
@@ -840,7 +840,7 @@ impl Engine {
                     .iter()
                     .map(|e| {
                         serde_json::json!({
-                            "node": topics::node_hex(e.node),
+                            "addr": topics::node_hex(e.node_addr),
                             "ref": e.item,
                             "age_s": e.age_s,
                             "ttl_s": e.ttl_s,
@@ -856,7 +856,7 @@ impl Engine {
                 // the RPC params, so re-list pending from the mirror by pruning the
                 // ref recorded at issue time (see rpc handling; the ref rides in op).
                 self.rpc_ok(out, &p, serde_json::Value::Null);
-                if let Some(i) = self.nodes.iter().position(|n| n.entry.id == node) {
+                if let Some(i) = self.nodes.iter().position(|n| n.entry.addr == node) {
                     self.publish_pending(out, i);
                 }
                 self.issue(out, OpKind::NodeList, MgmtOp::NodeList, None);
@@ -949,7 +949,7 @@ impl Engine {
             });
             out.push(Output::Event(Event::Shell { node, rsp }));
         };
-        if self.nodes.iter().all(|n| n.entry.id != node) {
+        if self.nodes.iter().all(|n| n.entry.addr != node) {
             return fail(self, out, "unknown node");
         }
         if req.line.len() > radio::RADIO_SHELL_CHUNK {
@@ -986,7 +986,7 @@ impl Engine {
         };
         // The borrow-carrying op is encoded immediately by `issue`.
         let op = MgmtOp::QueuePush {
-            node,
+            node_addr: node,
             ttl_s: req.ttl_s,
             data: &data,
         };
@@ -1007,12 +1007,12 @@ impl Engine {
         let rpc = Some(req.id.clone());
         let params = &req.params;
         let node_param = || -> Option<u32> {
-            let v = params.get("node")?.as_str()?;
+            let v = params.get("addr")?.as_str()?;
             topics::parse_node_hex(v).or_else(|| {
                 self.nodes
                     .iter()
                     .find(|n| n.entry.name == v)
-                    .map(|n| n.entry.id)
+                    .map(|n| n.entry.addr)
             })
         };
         match req.op.as_str() {
@@ -1022,7 +1022,7 @@ impl Engine {
                 // Cable pairing: the client provisioned the node on its own serial
                 // port and registers (id, key, name) here.
                 let id = params
-                    .get("id")
+                    .get("addr")
                     .and_then(|v| v.as_str())
                     .and_then(topics::parse_node_hex);
                 let key = params
@@ -1039,7 +1039,7 @@ impl Engine {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
                 let (Some(id), Some(key)) = (id, key) else {
-                    return self.rpc_err_direct(out, &req.id, "node_add needs id + key (hex)");
+                    return self.rpc_err_direct(out, &req.id, "node_add needs addr + key (hex)");
                 };
                 let mut flags = if sleeping {
                     mgmt::NODE_FLAG_SLEEPING
@@ -1050,7 +1050,7 @@ impl Engine {
                     flags |= mgmt::NODE_FLAG_UNNAMED;
                 }
                 let op = MgmtOp::NodeAdd {
-                    id,
+                    addr: id,
                     key,
                     name: name.as_str(),
                     flags,
@@ -1069,7 +1069,7 @@ impl Engine {
                 Some(id) => self.issue(
                     out,
                     OpKind::NodeRemove { id },
-                    MgmtOp::NodeRemove { id },
+                    MgmtOp::NodeRemove { addr: id },
                     rpc,
                 ),
                 None => self.rpc_err_direct(out, &req.id, "unknown node"),
@@ -1091,10 +1091,10 @@ impl Engine {
                 let flags = self
                     .nodes
                     .iter()
-                    .find(|n| n.entry.id == id)
+                    .find(|n| n.entry.addr == id)
                     .map(|n| n.entry.flags & !mgmt::NODE_FLAG_UNNAMED);
                 let op = MgmtOp::NodeUpdate {
-                    id,
+                    addr: id,
                     name: Some(name),
                     flags,
                 };
@@ -1104,7 +1104,7 @@ impl Engine {
                 Some(id) => self.issue(
                     out,
                     OpKind::RevealKey { id },
-                    MgmtOp::NodeRevealKey { id },
+                    MgmtOp::NodeRevealKey { addr: id },
                     rpc,
                 ),
                 None => self.rpc_err_direct(out, &req.id, "unknown node"),
@@ -1142,7 +1142,12 @@ impl Engine {
             }
             "queue_list" => {
                 let node = node_param().unwrap_or(0);
-                self.issue(out, OpKind::QueueList, MgmtOp::QueueList { node }, rpc);
+                self.issue(
+                    out,
+                    OpKind::QueueList,
+                    MgmtOp::QueueList { node_addr: node },
+                    rpc,
+                );
             }
             "queue_drop" => {
                 let Some(node) = node_param() else {
@@ -1152,7 +1157,7 @@ impl Engine {
                 // Prune the mirror entry now (the device answer confirms; a NotFound
                 // still clears our side, which matches "it isn't queued anymore").
                 if let (Some(it), Some(i)) =
-                    (item, self.nodes.iter().position(|n| n.entry.id == node))
+                    (item, self.nodes.iter().position(|n| n.entry.addr == node))
                     && let Some(pi) = self.nodes[i].pending.iter().position(|pd| pd.item == it)
                 {
                     let pd = self.nodes[i].pending.remove(pi);
@@ -1162,7 +1167,10 @@ impl Engine {
                 self.issue(
                     out,
                     OpKind::QueueDrop { node },
-                    MgmtOp::QueueDrop { node, item },
+                    MgmtOp::QueueDrop {
+                        node_addr: node,
+                        item,
+                    },
                     rpc,
                 );
             }
@@ -1212,7 +1220,7 @@ impl Engine {
         }
         // Remote-shell reply timeouts (delivered but never answered).
         for i in 0..self.nodes.len() {
-            let node = self.nodes[i].entry.id;
+            let node = self.nodes[i].entry.addr;
             let dead: Vec<usize> = self.nodes[i]
                 .pending
                 .iter()
@@ -1355,7 +1363,7 @@ impl Engine {
     fn merge_registry(&mut self, fresh: Vec<NodeEntryOwned>, out: &mut Vec<Output>) {
         let mut next: Vec<NodeMirror> = Vec::with_capacity(fresh.len());
         for entry in fresh {
-            let old = self.nodes.iter_mut().find(|n| n.entry.id == entry.id);
+            let old = self.nodes.iter_mut().find(|n| n.entry.addr == entry.addr);
             match old {
                 Some(o) => next.push(NodeMirror {
                     entry,
@@ -1375,10 +1383,10 @@ impl Engine {
         for gone in self
             .nodes
             .iter()
-            .filter(|o| next.iter().all(|n| n.entry.id != o.entry.id))
+            .filter(|o| next.iter().all(|n| n.entry.addr != o.entry.addr))
         {
             out.push(Output::Publish {
-                topic: topics::node(&self.prefix, gone.entry.id),
+                topic: topics::node(&self.prefix, gone.entry.addr),
                 payload: Vec::new(),
                 retain: true,
             });
@@ -1393,7 +1401,7 @@ impl Engine {
     /// Refresh a node's RAM-side liveliness on an uplink (the device tracks this too;
     /// mirroring it keeps the TUI live without polling NodeList).
     fn touch_node(&mut self, id: u32, rssi_dbm: i16) {
-        if let Some(n) = self.nodes.iter_mut().find(|n| n.entry.id == id) {
+        if let Some(n) = self.nodes.iter_mut().find(|n| n.entry.addr == id) {
             n.entry.last_seen_s = 0;
             n.entry.rssi_dbm = rssi_dbm.clamp(i8::MIN as i16, i8::MAX as i16) as i8;
             n.entry.uplinks = n.entry.uplinks.saturating_add(1);
@@ -1404,7 +1412,7 @@ impl Engine {
         self.nodes
             .iter()
             .map(|n| payload::Node {
-                id: topics::node_hex(n.entry.id),
+                addr: topics::node_hex(n.entry.addr),
                 name: n.entry.name.clone(),
                 kind: n.kind.clone(),
                 sleeping: n.entry.flags & mgmt::NODE_FLAG_SLEEPING != 0,
@@ -1421,7 +1429,7 @@ impl Engine {
     fn publish_node(&self, out: &mut Vec<Output>, i: usize) {
         let payloads = self.node_payloads();
         out.push(Output::Publish {
-            topic: topics::node(&self.prefix, self.nodes[i].entry.id),
+            topic: topics::node(&self.prefix, self.nodes[i].entry.addr),
             payload: json(&payloads[i]),
             retain: true,
         });
@@ -1438,7 +1446,7 @@ impl Engine {
             })
             .collect();
         out.push(Output::Publish {
-            topic: topics::node_shell_pending(&self.prefix, self.nodes[i].entry.id),
+            topic: topics::node_shell_pending(&self.prefix, self.nodes[i].entry.addr),
             payload: json(&entries),
             retain: true,
         });
@@ -1450,7 +1458,7 @@ impl Engine {
             .nodes
             .iter()
             .map(|n| NodeView {
-                id: n.entry.id,
+                addr: n.entry.addr,
                 name: n.entry.name.clone(),
                 kind: n.kind.clone(),
                 sleeping: n.entry.flags & mgmt::NODE_FLAG_SLEEPING != 0,
@@ -1481,7 +1489,7 @@ impl Engine {
             payload: json(&payload::Status {
                 state: state.into(),
                 schema: payload::SCHEMA,
-                gateway: topics::node_hex(self.describe.net_id),
+                gateway: topics::node_hex(self.describe.addr),
                 firmware: self.describe.firmware_name.clone(),
                 firmware_version: self.firmware_version.clone(),
                 session_id: self.hello_session.unwrap_or(0),
@@ -1537,13 +1545,13 @@ mod tests {
             crate::mgmt::DeviceInfoOwned {
                 role: DeviceRole::Gateway,
                 radio_schema_version: radio::RADIO_SCHEMA_VERSION,
-                net_id: 0x0000_0001,
+                addr: 0x0000_0001,
                 band: 0,
                 channel: 0,
                 node_capacity: 32,
                 node_count: 0,
                 provisioned: true,
-                gw_id: 0x0000_0001,
+                gw_addr: 0x0000_0001,
                 firmware_name: "radio_dongle_gateway".into(),
             },
         )
@@ -1590,7 +1598,7 @@ mod tests {
 
     fn node_entry_record(id: u32, name: &str, flags: u8) -> Vec<u8> {
         postcard::to_stdvec(&NodeEntry {
-            id,
+            addr: id,
             name,
             flags,
             last_seen_s: 3,
@@ -2028,7 +2036,7 @@ mod tests {
         with_node(&mut e, 0xAB12, "kitchen", 0);
         let out = e.handle(Input::MqttIn {
             topic: "tower/gateway/cmd".into(),
-            payload: br#"{"id":"u-rk","op":"reveal_key","params":{"node":"0x0000ab12"}}"#.to_vec(),
+            payload: br#"{"id":"u-rk","op":"reveal_key","params":{"addr":"0x0000ab12"}}"#.to_vec(),
         });
         let (req_id, op) = out.iter().find_map(sent_op).expect("NodeRevealKey issued");
         assert!(op.contains("NodeRevealKey"), "{op}");
@@ -2036,13 +2044,13 @@ mod tests {
             0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
             0x06, 0x07,
         ];
-        let rec = postcard::to_stdvec(&NodeKey { id: 0xAB12, key }).unwrap();
+        let rec = postcard::to_stdvec(&NodeKey { addr: 0xAB12, key }).unwrap();
         let out = reply(&mut e, req_id, MGMT_OK, &rec);
         let raw = publishes(&out, "tower/gateway/rsp/u-rk");
         assert_eq!(raw.len(), 1);
         let rsp: RpcResponse = serde_json::from_slice(raw[0]).unwrap();
         assert!(rsp.ok);
-        assert_eq!(rsp.data["node"], "0x0000ab12");
+        assert_eq!(rsp.data["addr"], "0x0000ab12");
         assert_eq!(rsp.data["key"], "0123456789abcdef0001020304050607");
     }
 
@@ -2052,7 +2060,7 @@ mod tests {
         with_node(&mut e, 0xAB12, "kitchen", 0);
         let out = e.handle(Input::MqttIn {
             topic: "tower/gateway/cmd".into(),
-            payload: br#"{"id":"u-rm","op":"node_remove","params":{"node":"0x0000ab12"}}"#.to_vec(),
+            payload: br#"{"id":"u-rm","op":"node_remove","params":{"addr":"0x0000ab12"}}"#.to_vec(),
         });
         let (req_id, op) = out.iter().find_map(sent_op).expect("NodeRemove issued");
         assert!(op.contains("NodeRemove"), "{op}");

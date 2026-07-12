@@ -99,7 +99,7 @@ The MQTT topic tree (under `--prefix`) is the gateway's public API — the full 
 in [`src/gateway/topics.rs`](src/gateway/topics.rs).
 
 The **client** commands drive a running gateway over MQTT (they share `--mqtt`/`--prefix`;
-`<node>` is a `0xHHHHHHHH` id or a friendly name):
+`<node>` is a `0xHHHHHHHH` address or a friendly name):
 
 ```sh
 tower nodes list                                   # the gateway's registered nodes

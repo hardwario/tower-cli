@@ -21,13 +21,13 @@ use crate::session::Transport;
 pub(crate) struct DeviceInfoOwned {
     pub role: DeviceRole,
     pub radio_schema_version: u8,
-    pub net_id: u32,
+    pub addr: u32,
     pub band: u8,
     pub channel: u8,
     pub node_capacity: u8,
     pub node_count: u8,
     pub provisioned: bool,
-    pub gw_id: u32,
+    pub gw_addr: u32,
     pub firmware_name: String,
 }
 
@@ -36,13 +36,13 @@ impl From<DeviceInfo<'_>> for DeviceInfoOwned {
         Self {
             role: d.role,
             radio_schema_version: d.radio_schema_version,
-            net_id: d.net_id,
+            addr: d.addr,
             band: d.band,
             channel: d.channel,
             node_capacity: d.node_capacity,
             node_count: d.node_count,
             provisioned: d.provisioned,
-            gw_id: d.gw_id,
+            gw_addr: d.gw_addr,
             firmware_name: d.firmware_name.to_string(),
         }
     }
@@ -51,7 +51,7 @@ impl From<DeviceInfo<'_>> for DeviceInfoOwned {
 /// Owned `NodeEntry` — one registry row from `NodeList`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NodeEntryOwned {
-    pub id: u32,
+    pub addr: u32,
     pub name: String,
     pub flags: u8,
     pub last_seen_s: u32,
@@ -63,7 +63,7 @@ pub(crate) struct NodeEntryOwned {
 impl From<NodeEntry<'_>> for NodeEntryOwned {
     fn from(e: NodeEntry<'_>) -> Self {
         Self {
-            id: e.id,
+            addr: e.addr,
             name: e.name.to_string(),
             flags: e.flags,
             last_seen_s: e.last_seen_s,
@@ -80,7 +80,7 @@ impl From<NodeEntry<'_>> for NodeEntryOwned {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueueEntryOwned {
-    pub node: u32,
+    pub node_addr: u32,
     pub item: u16,
     pub age_s: u16,
     pub ttl_s: u16,
@@ -90,7 +90,7 @@ pub(crate) struct QueueEntryOwned {
 impl From<QueueEntry<'_>> for QueueEntryOwned {
     fn from(e: QueueEntry<'_>) -> Self {
         Self {
-            node: e.node,
+            node_addr: e.node_addr,
             item: e.item,
             age_s: e.age_s,
             ttl_s: e.ttl_s,
@@ -391,13 +391,13 @@ mod tests {
         let info = DeviceInfo {
             role: DeviceRole::Gateway,
             radio_schema_version: 1,
-            net_id: 0xAB12,
+            addr: 0xAB12,
             band: 0,
             channel: 0,
             node_capacity: 32,
             node_count: 2,
             provisioned: true,
-            gw_id: 0xAB12,
+            gw_addr: 0xAB12,
             firmware_name: "radio_dongle_gateway",
         };
         let rec = postcard::to_stdvec(&info).unwrap();
@@ -407,7 +407,7 @@ mod tests {
         match describe(&mut m, &mut dec, 1, Duration::from_millis(300)) {
             DescribeOutcome::Info(d) => {
                 assert_eq!(d.role, DeviceRole::Gateway);
-                assert_eq!(d.net_id, 0xAB12);
+                assert_eq!(d.addr, 0xAB12);
                 assert_eq!(d.firmware_name, "radio_dongle_gateway");
             }
             _ => panic!("expected device info"),
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn record_stream_parses() {
         let a = NodeEntry {
-            id: 1,
+            addr: 1,
             name: "a",
             flags: 0,
             last_seen_s: 5,
@@ -426,7 +426,7 @@ mod tests {
             queued: 0,
         };
         let b = NodeEntry {
-            id: 2,
+            addr: 2,
             name: "b",
             flags: 1,
             last_seen_s: u32::MAX,
@@ -438,7 +438,7 @@ mod tests {
         stream.extend(postcard::to_stdvec(&b).unwrap());
         let parsed: Vec<NodeEntry> = parse_records(&stream);
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].id, 1);
+        assert_eq!(parsed[0].addr, 1);
         assert_eq!(parsed[1].name, "b");
         let owned: Vec<NodeEntryOwned> = parsed.into_iter().map(Into::into).collect();
         assert_eq!(owned[1].flags, 1);

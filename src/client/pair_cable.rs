@@ -56,10 +56,10 @@ pub(crate) fn run(s: &mut Session, node_port: &str, name: Option<&str>) -> Resul
         );
         return Ok(EXIT_WRONG_FIRMWARE);
     }
-    let node_id = node_info.net_id;
+    let node_addr = node_info.addr;
     eprintln!(
         "[tower] node {} (\"{}\"){}",
-        topics::node_hex(node_id),
+        topics::node_hex(node_addr),
         node_info.firmware_name,
         if node_info.provisioned {
             " — already provisioned, re-pairing"
@@ -75,7 +75,7 @@ pub(crate) fn run(s: &mut Session, node_port: &str, name: Option<&str>) -> Resul
         .and_then(|v| v.as_str())
         .context("gateway describe: missing id")?
         .to_string();
-    let gw_id = topics::parse_node_hex(&gw_hex).context("gateway describe: bad id")?;
+    let gw_addr = topics::parse_node_hex(&gw_hex).context("gateway describe: bad id")?;
     let band = gw.get("band").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
     let channel = gw.get("channel").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 
@@ -87,7 +87,7 @@ pub(crate) fn run(s: &mut Session, node_port: &str, name: Option<&str>) -> Resul
     s.rpc_ok(
         "node_add",
         serde_json::json!({
-            "id": topics::node_hex(node_id),
+            "addr": topics::node_hex(node_addr),
             "key": key_hex(&key),
             "name": name.unwrap_or(""),
             "sleeping": true,
@@ -101,8 +101,8 @@ pub(crate) fn run(s: &mut Session, node_port: &str, name: Option<&str>) -> Resul
         &mut dec,
         0x7101,
         &MgmtOp::Provision(Provision {
-            my_id: None,
-            gw_id,
+            addr: None,
+            gw_addr,
             key,
             band,
             channel,
@@ -113,7 +113,7 @@ pub(crate) fn run(s: &mut Session, node_port: &str, name: Option<&str>) -> Resul
         MgmtOutcome::Reply(r) if r.result == tower_protocol::mgmt::MGMT_OK => {
             println!(
                 "paired {} → gateway {gw_hex}{}",
-                topics::node_hex(node_id),
+                topics::node_hex(node_addr),
                 name.map(|n| format!(" as \"{n}\"")).unwrap_or_default()
             );
             eprintln!("[tower] node is rebooting into its new identity");
@@ -123,7 +123,7 @@ pub(crate) fn run(s: &mut Session, node_port: &str, name: Option<&str>) -> Resul
             // Roll the gateway registration back — no phantom peers.
             let _ = s.rpc(
                 "node_remove",
-                serde_json::json!({ "node": topics::node_hex(node_id) }),
+                serde_json::json!({ "addr": topics::node_hex(node_addr) }),
             );
             match other {
                 MgmtOutcome::Reply(r) => {

@@ -17,8 +17,9 @@
 //! implementation. The F2 pairing menu offers OTA (countdown popup, Esc cancels),
 //! "catch the cable-connected device" (pairs the first newly plugged port), and a
 //! grow-only port picker — the cable flows run `gateway::pair` on a worker thread
-//! (the same five steps as `tower nodes add --port`). Panes focus by Shift-Tab or
-//! mouse click.
+//! (the same five steps as `tower nodes add --port`). Panes focus by **F1 / Shift-F1**
+//! (clockwise / counter-clockwise), a mouse click (when capture is on), or **F3** to zoom
+//! the focused pane borderless; **F9** toggles mouse capture so terminal text selection works.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;

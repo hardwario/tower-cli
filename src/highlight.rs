@@ -98,9 +98,9 @@ mod tests {
 
     #[test]
     fn response_splits_key_value_and_passes_raw() {
-        let kv = response("temp-period = 60");
+        let kv = response("therm-period = 60");
         let txt: String = kv.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(txt, "temp-period = 60");
+        assert_eq!(txt, "therm-period = 60");
         assert!(kv.spans.len() >= 3, "key / sep / value");
         // A plain line with no separator survives verbatim as one raw span.
         let raw = response("just some text");

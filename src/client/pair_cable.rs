@@ -73,9 +73,9 @@ pub(crate) fn run(s: &mut Session, node_port: &str, name: Option<&str>) -> Resul
     let gw_hex = gw
         .get("gateway")
         .and_then(|v| v.as_str())
-        .context("gateway describe: missing id")?
+        .context("gateway describe: missing address")?
         .to_string();
-    let gw_addr = topics::parse_node_hex(&gw_hex).context("gateway describe: bad id")?;
+    let gw_addr = topics::parse_node_hex(&gw_hex).context("gateway describe: bad address")?;
     let band = gw.get("band").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
     let channel = gw.get("channel").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
 

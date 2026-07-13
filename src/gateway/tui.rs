@@ -1,12 +1,12 @@
 //! The gateway TUI — the interactive frontend of `tower gateway` (the default mode).
 //! Same DNA as the `tower console` TUI (`src/tui.rs`): a single synchronous 33 ms
-//! poll loop, gray header/footer with chip toggles, Cyan focused border — but a
+//! poll loop, gray header/footer with chip toggles, LightRed focused border — but a
 //! layout built for network coordination:
 //!
 //! ```text
-//!  Nodes table (select/remove/rename/reveal) │ Radio chart (ambient trace + RX/TX)
+//!  Nodes table (select/remove/rename/reveal) │ Radio chart (ambient bars + RX/TX)
 //!  ──────────────────────────────────────────┼──────────────────────────────────────
-//!  per-node remote-shell dialog (⌛ pending)  │ MQTT feed (JSON-highlighted; f = per-
+//!  per-node remote-shell dialog (⌛ pending)  │ MQTT feed (JSON-highlighted; F7 = per-
 //!                                            │ node filter, view-only — nothing lost)
 //!  ──────────────────────────────────────────┴──────────────────────────────────────
 //!  gateway log strip (full width)
@@ -19,7 +19,8 @@
 //! grow-only port picker — the cable flows run `gateway::pair` on a worker thread
 //! (the same five steps as `tower nodes add --port`). Panes focus by **F1 / Shift-F1**
 //! (clockwise / counter-clockwise), a mouse click (when capture is on), or **F3** to zoom
-//! the focused pane borderless; **F9** toggles mouse capture so terminal text selection works.
+//! the focused pane borderless; **F9** toggles mouse capture so terminal text selection
+//! works. While capture is on, the footer chips are clickable buttons for their keys.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -49,7 +50,7 @@ const DIALOG_CAP: usize = 500;
 /// predicate over this deque — filtering never drops a message.
 const MQTT_CAP: usize = 500;
 /// Radio-graph retention, in readings (the visible window is the pane width — one
-/// column per reading; this only bounds the deques for the widest terminals).
+/// bar per reading; this only bounds the deques for the widest terminals).
 const CHART_HISTORY: usize = 600;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,8 +147,8 @@ struct App {
     focus: Pane,
     /// F3: the focused pane fills the whole body, borderless.
     zoom: bool,
-    /// F9: mouse capture (click-to-focus). Off = the terminal's native text
-    /// selection/copy works again.
+    /// F9: mouse capture (click-to-focus + footer-chip buttons). Off = the
+    /// terminal's native text selection/copy works again.
     mouse: bool,
     paused: bool,
     serial_up: bool,
@@ -198,6 +199,9 @@ struct App {
     last_port_poll: Instant,
     /// Last-frame pane rectangles for click-to-focus.
     zones: PaneZones,
+    /// Last-frame footer-chip rectangles — each chip is a button; a click
+    /// presses the key it carries.
+    chips: Vec<(Rect, KeyCode)>,
 }
 
 impl App {
@@ -445,6 +449,7 @@ pub(crate) fn run(
         cable: None,
         last_port_poll: Instant::now(),
         zones: PaneZones::default(),
+        chips: Vec::new(),
     };
     let mut terminal = ratatui::init();
     // Click-to-focus needs mouse events; released with the terminal below.
@@ -482,7 +487,9 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()
 }
 
 /// Click-to-focus: a left click inside a pane focuses it (modals keep the
-/// keyboard-only flow — a click just falls through while one is open).
+/// keyboard-only flow — a click just falls through while one is open). The
+/// footer chips double as buttons: a click presses the chip's key, and a
+/// Shift-click on the F1 chip walks focus counter-clockwise like Shift-F1.
 fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     if !app.mouse
         || app.modal.is_some()
@@ -493,6 +500,18 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     let hit = |r: Rect| -> bool {
         m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height
     };
+    let chip = app.chips.iter().find(|(r, _)| hit(*r)).map(|&(_, k)| k);
+    if let Some(key) = chip {
+        match key {
+            // Node-scoped chips go straight to the Nodes key map so they act
+            // on the selected node no matter which pane holds focus.
+            KeyCode::F(4) | KeyCode::F(6) | KeyCode::Delete | KeyCode::Char('p') => {
+                handle_nodes_key(app, key);
+            }
+            _ => handle_key(app, key, m.modifiers),
+        }
+        return;
+    }
     for (rect, pane) in [
         (app.zones.nodes, Pane::Nodes),
         (app.zones.radio, Pane::Radio),
@@ -664,6 +683,18 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             };
         }
         (KeyCode::F(5), _) => app.paused = !app.paused,
+        // F7 toggles the per-node MQTT filter from any pane; `f` on the MQTT and
+        // Nodes panes is the pane-local alias (kept off the footer, like `r`/`k`).
+        (KeyCode::F(7), _) => toggle_mqtt_filter(app),
+        // The node-action keys advertised on the footer work from any pane —
+        // they act on the SELECTED node, exactly like their chips.
+        (KeyCode::F(4) | KeyCode::F(6), _) => handle_nodes_key(app, code),
+        // Del = remove (with confirmation). macOS keyboards send Backspace for
+        // the key labeled "delete", so accept both — except on the Shell pane,
+        // where Backspace belongs to line editing.
+        (KeyCode::Delete | KeyCode::Backspace, _) if app.focus != Pane::Shell => {
+            handle_nodes_key(app, KeyCode::Delete);
+        }
         // F8 clears the focused feed (MQTT when its pane is focused, else the log).
         (KeyCode::F(8), _) => match app.focus {
             Pane::Mqtt => {
@@ -1147,44 +1178,63 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line).style(bar), area);
 }
 
-fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let bar = Style::new().bg(Color::Gray).fg(Color::Black);
-    let chip = |label: &str, active: bool| -> Span<'static> {
-        if active {
+    // Label, lit-when-active flag, and the key a click on the chip presses.
+    let chips: [(&str, bool, KeyCode); 12] = [
+        ("[Shift-]F1 Focus", false, KeyCode::F(1)),
+        ("F3 Zoom", app.zoom, KeyCode::F(3)),
+        (
+            "F2 Pair",
+            app.pairing.as_ref().is_some_and(|p| p.state == "open"),
+            KeyCode::F(2),
+        ),
+        ("F4 Key", false, KeyCode::F(4)),
+        ("F5 Pause", app.paused, KeyCode::F(5)),
+        ("F6 Rename", false, KeyCode::F(6)),
+        ("Del Remove", false, KeyCode::Delete),
+        ("p Pending", false, KeyCode::Char('p')),
+        ("F7 Filter", app.mqtt_filter.is_some(), KeyCode::F(7)),
+        ("F8 Clear", false, KeyCode::F(8)),
+        ("F9 Mouse", app.mouse, KeyCode::F(9)),
+        ("F10 Quit", false, KeyCode::F(10)),
+    ];
+    app.chips.clear();
+    let mut spans = Vec::with_capacity(chips.len());
+    let mut x = area.x;
+    for (label, active, key) in chips {
+        let text = format!(" {label} ");
+        let w = text.chars().count() as u16;
+        // Remember where the chip landed (clipped to the visible row) —
+        // `handle_mouse` treats these rectangles as buttons.
+        if x < area.right() {
+            let rect = Rect::new(x, area.y, w.min(area.right() - x), 1);
+            app.chips.push((rect, key));
+        }
+        x = x.saturating_add(w);
+        spans.push(if active {
             Span::styled(
-                format!(" {label} "),
+                text,
                 Style::new()
                     .bg(Color::Yellow)
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled(format!(" {label} "), bar)
-        }
-    };
-    let line = Line::from(vec![
-        chip("F1 Focus", false),
-        chip("F3 Zoom", app.zoom),
-        chip(
-            "F2 Pair",
-            app.pairing.as_ref().is_some_and(|p| p.state == "open"),
-        ),
-        chip("F4 Key", false),
-        chip("F5 Pause", app.paused),
-        chip("F6 Rename", false),
-        chip("p Pending", false),
-        chip("f Filter", app.mqtt_filter.is_some()),
-        chip("F8 Clear", false),
-        chip("F9 Mouse", app.mouse),
-        chip("F10 Quit", false),
-    ]);
-    f.render_widget(Paragraph::new(line).style(bar), area);
+            Span::styled(text, bar)
+        });
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
     let mut b = Block::bordered().title(title);
     if focused {
-        b = b.border_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        b = b.border_style(
+            Style::new()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        );
     }
     b
 }
@@ -1261,44 +1311,68 @@ fn render_nodes(f: &mut Frame, app: &App, area: Rect, zoomed: bool) {
 /// Ambient bars turn from "floor" to "busy" to "hot" at these levels (dBm).
 const CHART_BUSY_DBM: f64 = -85.0;
 const CHART_HOT_DBM: f64 = -70.0;
+/// The chart's y range (dBm) — every bar rises from this floor to its reading.
+const CHART_MIN_DBM: f64 = -110.0;
+const CHART_MAX_DBM: f64 = -30.0;
+/// Bar geometry in plot columns: 2 wide + 1 gap (a 2:1 ratio), so each reading
+/// owns BAR_STRIDE columns.
+const BAR_W: usize = 2;
+const BAR_STRIDE: usize = BAR_W + 1;
 
 fn render_chart(f: &mut Frame, app: &App, area: Rect, zoomed: bool) {
-    // The x axis is the READING INDEX (newest = 0, one column per reading), not
-    // wall-clock time. Clock-based placement re-quantized jittery sample timestamps
-    // into columns differently as the window slid, so history appeared to blend and
-    // jump. Indexed slots give every reading one stable column for its whole life,
-    // the level stays pixel-identical while it scrolls, and the graph moves exactly
-    // one column per reading — nothing animates between readings.
+    // The x axis is the READING INDEX (newest = 0), not wall-clock time. Clock-based
+    // placement re-quantized jittery sample timestamps into columns differently as
+    // the window slid, so history appeared to blend and jump. Indexed slots give
+    // every reading one stable bar for its whole life, the level stays
+    // pixel-identical while it scrolls, and the graph moves exactly one bar per
+    // reading — nothing animates between readings.
     //
-    // Slots = the plot's column count, so readings map 1:1 onto columns (two
-    // readings sharing a column is what caused the blending). ratatui's Chart eats
-    // 1 border + 4 ("-110") + 2 axis gutter on the left and 1 border on the right.
+    // Slots = the plot's column count; each reading owns BAR_STRIDE columns of it
+    // (bar + gap), newest at the right edge. ratatui's Chart eats 1 border + 4
+    // ("-110") + 2 axis gutter on the left and 1 border on the right.
     let slots = (area.width.saturating_sub(if zoomed { 6 } else { 8 }) as usize).max(2);
-    let visible = app.ambient.len().min(slots);
-    // Ambient as a chunky dot trace (half-block points), split into level buckets
-    // so channel energy is readable as color, not just height (one style per
-    // dataset). Scatter, not Line: a line would connect non-adjacent readings
-    // WITHIN a bucket across the gaps where the level crossed into another bucket.
+    // Bar `back` fills columns x = -(back·BAR_STRIDE) .. and BAR_W-1 more to the
+    // left; only bars whose left column still fits inside the plot are drawn.
+    let bars = (slots + BAR_STRIDE - BAR_W) / BAR_STRIDE;
+    let visible = app.ambient.len().min(bars);
+    // Ambient as bottom-up bars: each reading's column pair is FILLED from the
+    // noise floor to its level (stacked half-block points ~1 dBm apart), split into
+    // level buckets so channel energy is readable as color, not just height (one
+    // style per dataset). Scatter on a Chart rather than ratatui's BarChart: the
+    // Chart keeps the dBm axis, the measured time labels and the rx/tx overlay.
     let mut quiet: Vec<(f64, f64)> = Vec::new();
     let mut busy: Vec<(f64, f64)> = Vec::new();
     let mut hot: Vec<(f64, f64)> = Vec::new();
     for (back, v) in app.ambient.iter().rev().take(visible).enumerate() {
-        let p = (-(back as f64), *v);
-        if *v <= CHART_BUSY_DBM {
-            quiet.push(p);
+        let bucket = if *v <= CHART_BUSY_DBM {
+            &mut quiet
         } else if *v <= CHART_HOT_DBM {
-            busy.push(p);
+            &mut busy
         } else {
-            hot.push(p);
+            &mut hot
+        };
+        let top = v.clamp(CHART_MIN_DBM, CHART_MAX_DBM);
+        for dx in 0..BAR_W {
+            let x = -((back * BAR_STRIDE + dx) as f64);
+            let mut y = CHART_MIN_DBM;
+            while y < top {
+                bucket.push((x, y));
+                y += 1.0;
+            }
+            bucket.push((x, top)); // the exact top, wherever the 1 dBm steps landed
         }
     }
-    // Marks ride the reading they arrived during, so they scroll in lockstep.
+    // Marks ride the reading they arrived during, so they scroll in lockstep —
+    // widened to the bar's columns so they cap the bar they belong to.
     let newest = app.ambient_seq;
     let marks = |points: &VecDeque<(u64, f64)>| -> Vec<(f64, f64)> {
         points
             .iter()
-            .filter(|(seq, _)| newest - seq < slots as u64)
-            .map(|(seq, v)| (-((newest - seq) as f64), *v))
+            .filter(|(seq, _)| newest - seq < bars as u64)
+            .flat_map(|(seq, v)| {
+                let back = (newest - seq) as usize;
+                (0..BAR_W).map(move |dx| (-((back * BAR_STRIDE + dx) as f64), *v))
+            })
             .collect()
     };
     let rx = marks(&app.rx_marks);
@@ -1334,9 +1408,9 @@ fn render_chart(f: &mut Frame, app: &App, area: Rect, zoomed: bool) {
         None => " Radio ".to_string(),
     };
     let dim = |s: String| Span::styled(s, Style::new().fg(Color::DarkGray));
-    // One reading per column; the time labels come from the MEASURED cadence
-    // (`ambient_ema_ms`), so they stay honest for any device stats-period.
-    let window_s = (slots - 1) as f64 * app.ambient_ema_ms / 1000.0;
+    // One reading per BAR_STRIDE columns; the time labels come from the MEASURED
+    // cadence (`ambient_ema_ms`), so they stay honest for any device stats-period.
+    let window_s = (slots - 1) as f64 * app.ambient_ema_ms / (BAR_STRIDE as f64 * 1000.0);
     let mut chart = Chart::new(datasets)
         .legend_position(Some(LegendPosition::TopLeft))
         .x_axis(
@@ -1350,7 +1424,7 @@ fn render_chart(f: &mut Frame, app: &App, area: Rect, zoomed: bool) {
         )
         .y_axis(
             Axis::default()
-                .bounds([-110.0, -30.0])
+                .bounds([CHART_MIN_DBM, CHART_MAX_DBM])
                 .labels([dim("-110".into()), dim("-70".into()), dim("-30".into())])
                 .title("dBm"),
         );
@@ -1577,14 +1651,14 @@ fn render_mqtt(f: &mut Frame, app: &App, area: Rect, zoomed: bool) {
         .collect();
     let title = match app.mqtt_filter {
         Some(n) => format!(
-            " MQTT ▶ {} · {}/{} msgs{} — f = all ",
+            " MQTT ▶ {} · {}/{} msgs{} — F7 = all ",
             topics::node_hex(n),
             shown.len(),
             app.mqtt.len(),
             if app.paused { " (paused)" } else { "" },
         ),
         None => format!(
-            " MQTT · {} msgs{} — f = filter node ",
+            " MQTT · {} msgs{} — F7 = filter node ",
             app.mqtt.len(),
             if app.paused { " (paused)" } else { "" },
         ),
@@ -1938,6 +2012,7 @@ mod tests {
             cable: None,
             last_port_poll: Instant::now(),
             zones: PaneZones::default(),
+            chips: Vec::new(),
         };
         (app, etx, irx)
     }
@@ -2102,6 +2177,94 @@ mod tests {
         assert_eq!(app.mqtt_filter, None);
         let grid = render(&mut app);
         assert!(grid.contains("nodes/0x0000bb34"));
+        // F7 is the global binding — it toggles from any pane, not just MQTT/Nodes.
+        app.focus = Pane::Log;
+        handle_key(&mut app, KeyCode::F(7), KeyModifiers::NONE);
+        assert_eq!(app.mqtt_filter, Some(0xAB12));
+        handle_key(&mut app, KeyCode::F(7), KeyModifiers::NONE);
+        assert_eq!(app.mqtt_filter, None);
+    }
+
+    #[test]
+    fn radio_bars_fill_bottom_up() {
+        let (mut app, _etx, _irx) = test_app();
+        for _ in 0..4 {
+            app.on_event(Event::Radio(RadioSample::Ambient {
+                dbm: -60,
+                channel: 5,
+            }));
+        }
+        let grid = render(&mut app);
+        // A -60 dBm reading spans most of the -110..-30 range: the filled column
+        // pairs must produce full-block cells (dots never did).
+        assert!(grid.contains('█'), "bars are filled from the floor up");
+        assert!(grid.contains("-60 dBm"), "live readout in the title");
+    }
+
+    #[test]
+    fn node_action_keys_are_global_except_shell_editing() {
+        let (mut app, _etx, _irx) = test_app();
+        app.on_event(Event::Registry(vec![node(0xAB12, "kitchen", 0)]));
+        // Delete works from any pane — it acts on the selected node…
+        app.focus = Pane::Log;
+        handle_key(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+        assert!(matches!(app.modal, Some(Modal::ConfirmRemove(0xAB12))));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE); // cancel
+        // …and so does Backspace (the key macOS keyboards label "delete").
+        app.focus = Pane::Nodes;
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(matches!(app.modal, Some(Modal::ConfirmRemove(0xAB12))));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        // On the Shell pane both stay line-editing keys — no modal.
+        app.focus = Pane::Shell;
+        app.line = "ab".into();
+        app.cursor = 2;
+        handle_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.line, "a");
+        assert!(app.modal.is_none());
+        // F6 Rename is global too, matching its footer chip.
+        app.focus = Pane::Mqtt;
+        handle_key(&mut app, KeyCode::F(6), KeyModifiers::NONE);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Rename { node: 0xAB12, .. })
+        ));
+    }
+
+    #[test]
+    fn footer_chips_click_as_buttons() {
+        let (mut app, _etx, _irx) = test_app();
+        app.on_event(Event::Registry(vec![node(0xAB12, "kitchen", 0)]));
+        render(&mut app); // populates app.chips
+        let click = |app: &mut App, key: KeyCode, mods: KeyModifiers| {
+            let (r, _) = *app.chips.iter().find(|(_, k)| *k == key).unwrap();
+            handle_mouse(
+                app,
+                event::MouseEvent {
+                    kind: event::MouseEventKind::Down(event::MouseButton::Left),
+                    column: r.x,
+                    row: r.y,
+                    modifiers: mods,
+                },
+            );
+        };
+        // A chip click presses its key: F5 toggles pause.
+        click(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        assert!(app.paused);
+        // Node-scoped chips act on the selected node from ANY focus: the Del
+        // chip opens the remove confirmation even while the log pane is focused.
+        app.focus = Pane::Log;
+        click(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+        assert!(matches!(app.modal, Some(Modal::ConfirmRemove(0xAB12))));
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE); // cancel
+        assert!(app.modal.is_none());
+        // Shift-click on the F1 chip = Shift-F1 (counter-clockwise walk).
+        click(&mut app, KeyCode::F(1), KeyModifiers::SHIFT);
+        assert!(app.focus == Pane::Mqtt, "Log walks back to MQTT");
+        // With mouse capture off, chip clicks are inert.
+        app.mouse = false;
+        click(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        assert!(app.paused, "click ignored while capture is off");
     }
 
     #[test]

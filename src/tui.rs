@@ -903,7 +903,7 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         }
     };
     let footer = Line::from(vec![
-        Span::raw(" <F1> Focus  "),
+        Span::raw(" <[Shift-]F1> Focus  "),
         chip("<F3> Zoom", app.zoom),
         Span::raw("  "),
         chip("<F5> Pause", app.paused),
@@ -1003,7 +1003,9 @@ fn render_text_pane<T>(
         Block::default()
     } else {
         let style = if focused {
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::new()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::new()
         };
@@ -1053,7 +1055,9 @@ fn render_text_pane<T>(
 fn render_shell(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Pane::Shell;
     let style = if focused {
-        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::new()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::new()
     };

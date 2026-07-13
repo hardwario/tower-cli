@@ -316,6 +316,12 @@ impl App {
                 }
             }
             Event::Radio(sample) => {
+                // Same pause discipline as the log/MQTT feeds. Unlike those (where pause
+                // freezes a view over retained data), the sample deques ARE the chart's
+                // data — so pause simply stops ingest, and the oscilloscope holds still.
+                if self.paused {
+                    return;
+                }
                 match sample {
                     RadioSample::Ambient { dbm, channel } => {
                         self.last_ambient = Some((dbm, channel));
@@ -1183,12 +1189,12 @@ fn render_footer(f: &mut Frame, app: &mut App, area: Rect) {
     // Label, lit-when-active flag, and the key a click on the chip presses.
     let chips: [(&str, bool, KeyCode); 12] = [
         ("[Shift-]F1 Focus", false, KeyCode::F(1)),
-        ("F3 Zoom", app.zoom, KeyCode::F(3)),
         (
             "F2 Pair",
             app.pairing.as_ref().is_some_and(|p| p.state == "open"),
             KeyCode::F(2),
         ),
+        ("F3 Zoom", app.zoom, KeyCode::F(3)),
         ("F4 Key", false, KeyCode::F(4)),
         ("F5 Pause", app.paused, KeyCode::F(5)),
         ("F6 Rename", false, KeyCode::F(6)),
@@ -1328,9 +1334,15 @@ fn render_chart(f: &mut Frame, app: &App, area: Rect, zoomed: bool) {
     // reading — nothing animates between readings.
     //
     // Slots = the plot's column count; each reading owns BAR_STRIDE columns of it
-    // (bar + gap), newest at the right edge. ratatui's Chart eats 1 border + 4
-    // ("-110") + 2 axis gutter on the left and 1 border on the right.
-    let slots = (area.width.saturating_sub(if zoomed { 6 } else { 8 }) as usize).max(2);
+    // (bar + gap), newest at the right edge. MUST equal the Chart's graph width
+    // EXACTLY: the canvas maps x → column as round((x−left)·(width−1)/span), which is
+    // 1:1 only when the bounds span slots−1 units over exactly `slots` columns — one
+    // column off and the rounding drifts, rendering ragged bars/gaps (seen 2026-07-13).
+    // ratatui-widgets 0.3 layout: left gutter = max(y-label width, first-x-label
+    // width − 1) + 1 for the axis line — both terms held at 4 here ("-110" is 4 chars;
+    // the time labels are clamped to ≤5 below) — plus the pane's 2 border columns when
+    // not zoomed. The x-label/axis rows cost height only, never columns.
+    let slots = (area.width.saturating_sub(if zoomed { 5 } else { 7 }) as usize).max(2);
     // Bar `back` fills columns x = -(back·BAR_STRIDE) .. and BAR_W-1 more to the
     // left; only bars whose left column still fits inside the plot are drawn.
     let bars = (slots + BAR_STRIDE - BAR_W) / BAR_STRIDE;
@@ -1403,22 +1415,34 @@ fn render_chart(f: &mut Frame, app: &App, area: Rect, zoomed: bool) {
             .data(&tx),
     ];
     // Live readout in the title — the number you'd otherwise squint at the bars for.
+    let paused = if app.paused { " (paused)" } else { "" };
     let title = match app.last_ambient {
-        Some((dbm, ch)) => format!(" Radio · {dbm} dBm · ch {ch} "),
-        None => " Radio ".to_string(),
+        Some((dbm, ch)) => format!(" Radio · {dbm} dBm · ch {ch}{paused} "),
+        None => format!(" Radio{paused} "),
     };
     let dim = |s: String| Span::styled(s, Style::new().fg(Color::DarkGray));
     // One reading per BAR_STRIDE columns; the time labels come from the MEASURED
     // cadence (`ambient_ema_ms`), so they stay honest for any device stats-period.
+    // Clamped to ≤5 chars — the FIRST x label's width sets the chart's left gutter,
+    // and a wider gutter would break the exact column mapping `slots` relies on.
     let window_s = (slots - 1) as f64 * app.ambient_ema_ms / (BAR_STRIDE as f64 * 1000.0);
+    let ago = |s: f64| -> String {
+        if s < 1000.0 {
+            format!("-{s:.0}s")
+        } else if s < 36_000.0 {
+            format!("-{:.0}m", s / 60.0)
+        } else {
+            format!("-{:.0}h", s / 3600.0)
+        }
+    };
     let mut chart = Chart::new(datasets)
         .legend_position(Some(LegendPosition::TopLeft))
         .x_axis(
             Axis::default()
                 .bounds([-((slots - 1) as f64), 0.0])
                 .labels([
-                    dim(format!("-{window_s:.0}s")),
-                    dim(format!("-{:.0}s", window_s / 2.0)),
+                    dim(ago(window_s)),
+                    dim(ago(window_s / 2.0)),
                     dim("now".into()),
                 ]),
         )
@@ -2199,6 +2223,62 @@ mod tests {
         // pairs must produce full-block cells (dots never did).
         assert!(grid.contains('█'), "bars are filled from the floor up");
         assert!(grid.contains("-60 dBm"), "live readout in the title");
+    }
+
+    #[test]
+    fn radio_bars_are_evenly_spaced() {
+        let (mut app, _etx, _irx) = test_app();
+        for _ in 0..40 {
+            app.on_event(Event::Radio(RadioSample::Ambient {
+                dbm: -60,
+                channel: 5,
+            }));
+        }
+        let grid = render(&mut app);
+        // Uniform readings ⇒ every bar is a full "██" column pair. The 2:1 rhythm must
+        // be exact across the whole plot: a lone "█", a "███" run, or a double gap
+        // means the x→column mapping aliased (slots ≠ the chart's true graph width).
+        let row = grid
+            .lines()
+            .find(|l| l.contains('█'))
+            .expect("a bar row renders");
+        let start = row.find('█').unwrap();
+        let end = row.rfind('█').unwrap() + '█'.len_utf8();
+        let bars: Vec<&str> = row[start..end].split(' ').collect();
+        assert!(bars.len() > 5, "several bars fit the test pane: {row:?}");
+        assert!(
+            bars.iter().all(|s| *s == "██"),
+            "bars 2 wide, gaps 1 wide, everywhere: {:?}",
+            &row[start..end]
+        );
+    }
+
+    #[test]
+    fn pause_freezes_the_radio_chart() {
+        let (mut app, _etx, _irx) = test_app();
+        app.on_event(Event::Radio(RadioSample::Ambient {
+            dbm: -60,
+            channel: 5,
+        }));
+        assert_eq!(app.ambient.len(), 1);
+        // F5: samples and marks stop ingesting (the deques ARE the chart), title readout freezes.
+        handle_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        app.on_event(Event::Radio(RadioSample::Ambient {
+            dbm: -50,
+            channel: 5,
+        }));
+        app.on_event(Event::Radio(RadioSample::Rx { src: 1, rssi: -60 }));
+        assert_eq!(app.ambient.len(), 1, "paused: no ambient ingest");
+        assert!(app.rx_marks.is_empty(), "paused: no mark ingest");
+        assert_eq!(app.last_ambient, Some((-60, 5)), "paused: readout frozen");
+        assert!(render(&mut app).contains("Radio · -60 dBm · ch 5 (paused)"));
+        // Unpause: ingest resumes.
+        handle_key(&mut app, KeyCode::F(5), KeyModifiers::NONE);
+        app.on_event(Event::Radio(RadioSample::Ambient {
+            dbm: -50,
+            channel: 5,
+        }));
+        assert_eq!(app.ambient.len(), 2);
     }
 
     #[test]
